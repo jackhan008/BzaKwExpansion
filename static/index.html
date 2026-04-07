@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brand Ad Keyword Expander</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f4f9;
+            color: #333;
+        }
+        h1 {
+            color: #0078d4;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        /* ── Tab bar ── */
+        .tab-bar {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+        }
+        .tab-btn {
+            padding: 10px 24px;
+            border: 1px solid #ccc;
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            background: #e8e8ee;
+            color: #555;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        .tab-btn.active {
+            background: white;
+            color: #0078d4;
+            border-color: #0078d4;
+        }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        /* ── Shared container ── */
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 0 8px 8px 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        label {
+            font-weight: bold;
+            display: block;
+            margin-bottom: 10px;
+        }
+        textarea {
+            width: 100%;
+            height: 150px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: inherit;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+        select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 14px;
+            background-color: white;
+            box-sizing: border-box;
+            margin-bottom: 20px;
+        }
+        .hint {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 5px;
+        }
+        .market-info {
+            font-size: 0.85em;
+            color: #0078d4;
+            margin-top: 5px;
+            padding: 8px;
+            background-color: #e1f0fa;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #0078d4;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 20px;
+            width: 100%;
+            transition: background-color 0.3s;
+        }
+        button:hover { background-color: #005a9e; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        #status {
+            margin-top: 20px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .success { color: green; }
+        .error   { color: red; }
+        .loading { color: #0078d4; }
+
+        /* ── Expand results ── */
+        #resultsArea { margin-top: 30px; display: none; }
+        .theme-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+            background-color: #fafafa;
+        }
+        .theme-title { font-weight: bold; font-size: 1.1em; color: #333; margin-bottom: 10px; }
+        .keyword-list { display: flex; flex-wrap: wrap; gap: 8px; }
+        .keyword-tag {
+            background-color: #e1f0fa;
+            color: #0078d4;
+            padding: 4px 10px;
+            border-radius: 15px;
+            font-size: 0.9em;
+        }
+        .match-count { margin-top: 10px; font-size: 0.9em; color: #666; }
+        #downloadSection { margin-top: 20px; text-align: center; display: none; }
+        .download-btn { background-color: #107c10; }
+        .download-btn:hover { background-color: #0b5a0b; }
+        .form-group { margin-bottom: 20px; }
+
+        /* ── History tab ── */
+        .history-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .history-toolbar h2 { margin: 0; }
+        .refresh-btn {
+            width: auto;
+            margin: 0;
+            padding: 8px 18px;
+            font-size: 14px;
+        }
+        #historyList { margin-top: 0; }
+        .job-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 14px;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            background: #fafafa;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .job-row:hover { background: #e8f3fc; }
+        .job-row-left { display: flex; flex-direction: column; gap: 3px; }
+        .job-id-tag {
+            font-family: monospace;
+            font-weight: bold;
+            color: #0078d4;
+        }
+        .job-meta { font-size: 0.85em; color: #666; }
+        .job-status {
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .status-done    { background: #d4edda; color: #155724; }
+        .status-running { background: #fff3cd; color: #856404; }
+        .status-error   { background: #f8d7da; color: #721c24; }
+        .status-pending { background: #e2e3e5; color: #383d41; }
+
+        /* ── Job Detail modal-like panel ── */
+        #jobDetailPanel {
+            display: none;
+            margin-top: 20px;
+            border: 1px solid #0078d4;
+            border-radius: 8px;
+            padding: 20px;
+            background: white;
+        }
+        #jobDetailPanel h3 { margin-top: 0; color: #0078d4; }
+        .back-link {
+            color: #0078d4;
+            cursor: pointer;
+            font-size: 0.9em;
+            text-decoration: underline;
+            display: inline-block;
+            margin-bottom: 12px;
+        }
+        .theme-detail-card {
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            margin-bottom: 12px;
+            overflow: hidden;
+        }
+        .theme-detail-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            background: #f0f4ff;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .theme-detail-header:hover { background: #dce6ff; }
+        .theme-detail-body {
+            padding: 12px 14px;
+            font-size: 0.9em;
+            display: none;
+        }
+        .theme-detail-body.open { display: block; }
+        .stat-row {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .stat-item { display: flex; flex-direction: column; }
+        .stat-label { font-size: 0.75em; color: #888; text-transform: uppercase; }
+        .stat-value { font-weight: bold; font-size: 1.1em; color: #333; }
+
+        .section-title { font-weight: 600; margin: 12px 0 6px; color: #555; }
+        .query-chip {
+            display: inline-block;
+            background: #e1f0fa;
+            color: #0078d4;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.82em;
+            margin: 2px;
+        }
+        .query-chip.invalid { background: #fde8e8; color: #c0392b; }
+
+        .batch-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+            margin-top: 8px;
+        }
+        .batch-table th {
+            text-align: left;
+            background: #f5f5f5;
+            padding: 6px 8px;
+            border-bottom: 1px solid #ddd;
+        }
+        .batch-table td {
+            padding: 5px 8px;
+            border-bottom: 1px solid #eee;
+            vertical-align: top;
+        }
+        .expand-batches-link {
+            color: #0078d4;
+            cursor: pointer;
+            font-size: 0.85em;
+            text-decoration: underline;
+            margin-top: 8px;
+            display: inline-block;
+        }
+        .batches-section { margin-top: 10px; display: none; }
+        .batches-section.open { display: block; }
+
+        #historyEmpty { color: #888; text-align: center; padding: 30px; }
+    </style>
+</head>
+<body>
+
+    <h1>Brand Ad Keyword Expander</h1>
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab('expand')">Expand</button>
+        <button class="tab-btn" onclick="switchTab('history')">History</button>
+    </div>
+
+    <!-- ── Expand tab ── -->
+    <div id="tab-expand" class="tab-panel active">
+        <div class="container">
+            <div class="form-group">
+                <label for="market">Select Target Market:</label>
+                <select id="market" onchange="updateMarketInfo()">
+                    <!-- populated dynamically -->
+                </select>
+                <div id="marketInfo" class="market-info"></div>
+            </div>
+
+            <div class="form-group">
+                <label for="themes">Enter Search Themes (one per line):</label>
+                <textarea id="themes" placeholder="e.g.&#10;Nike&#10;Running Shoes&#10;iPhone 15"></textarea>
+                <div class="hint">Each line is processed as a separate search theme.</div>
+            </div>
+
+            <button id="processBtn" onclick="processThemes()">Process Themes</button>
+
+            <div id="status"></div>
+
+            <div id="resultsArea">
+                <h2>Expansion Results</h2>
+                <div id="cardsContainer"></div>
+            </div>
+
+            <div id="downloadSection">
+                <button class="download-btn" onclick="downloadCSV()">Download Full Results (CSV)</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── History tab ── -->
+    <div id="tab-history" class="tab-panel">
+        <div class="container">
+            <div class="history-toolbar">
+                <h2 style="margin:0">Job History</h2>
+                <button class="refresh-btn" onclick="loadHistory()">Refresh</button>
+            </div>
+
+            <div id="historyList">
+                <div id="historyEmpty">No jobs yet. Run an expansion to see history.</div>
+            </div>
+
+            <!-- Job detail panel (shown below the list when a job is selected) -->
+            <div id="jobDetailPanel">
+                <span class="back-link" onclick="closeJobDetail()">← Back to list</span>
+                <h3 id="detailTitle">Job Detail</h3>
+                <div id="detailMeta" class="job-meta"></div>
+                <div id="detailThemes" style="margin-top:16px"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        /* ─────────────────── Tab switching ─────────────────── */
+        function switchTab(name) {
+            document.querySelectorAll('.tab-btn').forEach((b, i) => {
+                b.classList.toggle('active', ['expand','history'][i] === name);
+            });
+            document.querySelectorAll('.tab-panel').forEach(p => {
+                p.classList.toggle('active', p.id === 'tab-' + name);
+            });
+            if (name === 'history') loadHistory();
+        }
+
+        /* ─────────────────── Market init ─────────────────── */
+        let currentCsvContent = null;
+        let marketLanguages   = {};
+        let selectedMarket    = 'Australia';
+
+        document.addEventListener('DOMContentLoaded', loadMarkets);
+
+        async function loadMarkets() {
+            try {
+                const data = await fetch('/api/markets').then(r => r.json());
+                const select = document.getElementById('market');
+                marketLanguages = data.market_languages;
+                data.markets.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m; opt.textContent = m;
+                    if (m === data.default_market) { opt.selected = true; selectedMarket = m; }
+                    select.appendChild(opt);
+                });
+                updateMarketInfo();
+            } catch {
+                const select = document.getElementById('market');
+                const opt = document.createElement('option');
+                opt.value = 'Australia'; opt.textContent = 'Australia';
+                select.appendChild(opt);
+            }
+        }
+
+        function updateMarketInfo() {
+            const select = document.getElementById('market');
+            selectedMarket = select.value;
+            const langs = marketLanguages[selectedMarket] || ['English'];
+            document.getElementById('marketInfo').innerHTML =
+                `<strong>Languages:</strong> ${langs.join(', ')}<br>Keywords will be expanded in these languages for the ${selectedMarket} market.`;
+        }
+
+        /* ─────────────────── Expand logic ─────────────────── */
+        async function processThemes() {
+            const textarea = document.getElementById('themes');
+            const statusDiv = document.getElementById('status');
+            const btn = document.getElementById('processBtn');
+            const resultsArea = document.getElementById('resultsArea');
+            const cardsContainer = document.getElementById('cardsContainer');
+            const downloadSection = document.getElementById('downloadSection');
+
+            const text = textarea.value.trim();
+            if (!text) {
+                statusDiv.textContent = "Please enter at least one search theme.";
+                statusDiv.className = "error"; return;
+            }
+            const themes = text.split('\n').map(t => t.trim()).filter(t => t);
+            if (!themes.length) {
+                statusDiv.textContent = "Please enter valid search themes.";
+                statusDiv.className = "error"; return;
+            }
+
+            resultsArea.style.display = 'none';
+            downloadSection.style.display = 'none';
+            cardsContainer.innerHTML = '';
+            currentCsvContent = null;
+            btn.disabled = true;
+            btn.textContent = "Processing… (results appear below as they complete)";
+            statusDiv.textContent = "Expanding keywords and matching queries…";
+            statusDiv.className = "loading";
+            resultsArea.style.display = 'block';
+
+            try {
+                const response = await fetch('/api/expand_stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ themes, market: selectedMarket })
+                });
+                if (!response.ok) throw new Error(`Server error: ${response.statusText}`);
+
+                const reader  = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        try {
+                            const msg = JSON.parse(line);
+                            if (msg.type === 'theme_result') appendResultCard(msg.data);
+                            else if (msg.type === 'complete') {
+                                currentCsvContent = msg.csv_content;
+                                downloadSection.style.display = 'block';
+                                statusDiv.textContent = `Processing complete! Job ID: ${msg.job_id}`;
+                                statusDiv.className = "success";
+                            }
+                        } catch {}
+                    }
+                }
+            } catch (err) {
+                statusDiv.textContent = "An error occurred: " + err.message;
+                statusDiv.className = "error";
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Process Themes";
+            }
+        }
+
+        function appendResultCard(item) {
+            const container = document.getElementById('cardsContainer');
+            const card = document.createElement('div');
+            card.className = 'theme-card';
+
+            const title = document.createElement('div');
+            title.className = 'theme-title';
+            title.textContent = item.theme;
+            card.appendChild(title);
+
+            const list = document.createElement('div');
+            list.className = 'keyword-list';
+            item.expanded_keywords.forEach(kw => {
+                const tag = document.createElement('span');
+                tag.className = 'keyword-tag';
+                tag.textContent = kw;
+                list.appendChild(tag);
+            });
+            card.appendChild(list);
+
+            const count = document.createElement('div');
+            count.className = 'match-count';
+            count.textContent = `Found ${item.match_count} matching queries in database.`;
+            card.appendChild(count);
+
+            container.appendChild(card);
+        }
+
+        function downloadCSV() {
+            if (!currentCsvContent) { alert("No data to download."); return; }
+            const blob = new Blob([currentCsvContent], { type: 'text/csv' });
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.href = url; a.download = "expansion_results.csv";
+            document.body.appendChild(a); a.click();
+            URL.revokeObjectURL(url); a.remove();
+        }
+
+        /* ─────────────────── History logic ─────────────────── */
+        async function loadHistory() {
+            const list = document.getElementById('historyList');
+            list.innerHTML = '<div style="color:#888;text-align:center;padding:20px">Loading…</div>';
+            closeJobDetail();
+            try {
+                const jobs = await fetch('/api/jobs?limit=50').then(r => r.json());
+                renderJobList(jobs);
+            } catch (err) {
+                list.innerHTML = `<div class="error" style="text-align:center;padding:20px">Failed to load: ${err.message}</div>`;
+            }
+        }
+
+        function renderJobList(jobs) {
+            const list = document.getElementById('historyList');
+            if (!jobs || jobs.length === 0) {
+                list.innerHTML = '<div id="historyEmpty">No jobs yet. Run an expansion to see history.</div>';
+                return;
+            }
+            list.innerHTML = '';
+            jobs.forEach(job => {
+                const themes = safeParseJSON(job.themes, []);
+                const row = document.createElement('div');
+                row.className = 'job-row';
+                row.onclick = () => openJobDetail(job.job_id);
+                row.innerHTML = `
+                    <div class="job-row-left">
+                        <span class="job-id-tag">${job.job_id}</span>
+                        <span class="job-meta">
+                            Market: <strong>${job.market}</strong> &nbsp;|&nbsp;
+                            Themes: <strong>${themes.join(', ') || '—'}</strong>
+                        </span>
+                        <span class="job-meta">${job.created_at}${job.finished_at ? ' → ' + job.finished_at : ''}</span>
+                    </div>
+                    <span class="job-status status-${job.status}">${job.status}</span>
+                `;
+                list.appendChild(row);
+            });
+        }
+
+        async function openJobDetail(jobId) {
+            const panel = document.getElementById('jobDetailPanel');
+            panel.style.display = 'block';
+            document.getElementById('detailTitle').textContent = `Job: ${jobId}`;
+            document.getElementById('detailMeta').textContent = 'Loading…';
+            document.getElementById('detailThemes').innerHTML = '';
+
+            try {
+                const job = await fetch(`/api/jobs/${jobId}`).then(r => r.json());
+                const themeNames = safeParseJSON(job.themes, []);
+                document.getElementById('detailMeta').innerHTML =
+                    `Market: <strong>${job.market}</strong> &nbsp;|&nbsp;
+                     Status: <strong>${job.status}</strong> &nbsp;|&nbsp;
+                     Themes: <strong>${themeNames.join(', ')}</strong><br>
+                     Created: ${job.created_at}${job.finished_at ? ' &nbsp;|&nbsp; Finished: ' + job.finished_at : ''}`;
+
+                const themesDiv = document.getElementById('detailThemes');
+                const taskList = job.theme_tasks || [];
+                if (taskList.length === 0) {
+                    themesDiv.innerHTML = '<div style="color:#888">No theme tasks recorded yet.</div>';
+                } else {
+                    taskList.forEach(task => themesDiv.appendChild(buildThemeCard(task)));
+                }
+
+                // Scroll to panel
+                panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } catch (err) {
+                document.getElementById('detailMeta').innerHTML = `<span class="error">Error: ${err.message}</span>`;
+            }
+        }
+
+        function buildThemeCard(task) {
+            const card = document.createElement('div');
+            card.className = 'theme-detail-card';
+
+            const header = document.createElement('div');
+            header.className = 'theme-detail-header';
+            header.innerHTML = `
+                <span>${task.theme}</span>
+                <span class="job-status status-${task.status}">${task.status}</span>
+            `;
+            card.appendChild(header);
+
+            const body = document.createElement('div');
+            body.className = 'theme-detail-body';
+
+            // Stats row
+            const stats = document.createElement('div');
+            stats.className = 'stat-row';
+            stats.innerHTML = `
+                <div class="stat-item"><span class="stat-label">Matched</span><span class="stat-value">${task.match_count ?? '—'}</span></div>
+                <div class="stat-item"><span class="stat-label">Valid</span><span class="stat-value" style="color:green">${task.valid_count ?? '—'}</span></div>
+                <div class="stat-item"><span class="stat-label">Invalid</span><span class="stat-value" style="color:#c0392b">${task.invalid_count ?? '—'}</span></div>
+                <div class="stat-item"><span class="stat-label">Theme ID</span><span class="stat-value" style="font-size:0.85em;font-family:monospace">${task.theme_id}</span></div>
+            `;
+            body.appendChild(stats);
+
+            // Expanded keywords
+            if (task.expanded_keywords && task.expanded_keywords.length) {
+                const sec = document.createElement('div');
+                sec.innerHTML = `<div class="section-title">Expanded Keywords (${task.expanded_keywords.length})</div>`;
+                task.expanded_keywords.forEach(kw => {
+                    const chip = document.createElement('span');
+                    chip.className = 'query-chip'; chip.textContent = kw;
+                    sec.appendChild(chip);
+                });
+                body.appendChild(sec);
+            }
+
+            // Final (validated) queries
+            if (task.final_queries && task.final_queries.length) {
+                const sec = document.createElement('div');
+                sec.innerHTML = `<div class="section-title">Final Queries — passed validation (${task.final_queries.length})</div>`;
+                task.final_queries.slice(0, 50).forEach(q => {
+                    const chip = document.createElement('span');
+                    chip.className = 'query-chip'; chip.textContent = q;
+                    sec.appendChild(chip);
+                });
+                if (task.final_queries.length > 50) {
+                    const more = document.createElement('span');
+                    more.style.color = '#888'; more.style.fontSize = '0.82em';
+                    more.textContent = ` … and ${task.final_queries.length - 50} more`;
+                    sec.appendChild(more);
+                }
+                body.appendChild(sec);
+            }
+
+            // Validation batches link
+            const batchLink = document.createElement('span');
+            batchLink.className = 'expand-batches-link';
+            batchLink.textContent = 'Show validation batches ▼';
+            const batchesSection = document.createElement('div');
+            batchesSection.className = 'batches-section';
+            let batchesLoaded = false;
+
+            batchLink.onclick = async () => {
+                if (batchesSection.classList.contains('open')) {
+                    batchesSection.classList.remove('open');
+                    batchLink.textContent = 'Show validation batches ▼';
+                    return;
+                }
+                batchesSection.classList.add('open');
+                batchLink.textContent = 'Hide validation batches ▲';
+                if (!batchesLoaded) {
+                    batchesLoaded = true;
+                    batchesSection.innerHTML = '<div style="color:#888">Loading batches…</div>';
+                    try {
+                        const detail = await fetch(`/api/jobs/${task.job_id}/themes/${task.theme_id}`).then(r => r.json());
+                        renderBatches(batchesSection, detail.batches || []);
+                    } catch (err) {
+                        batchesSection.innerHTML = `<span class="error">Error: ${err.message}</span>`;
+                    }
+                }
+            };
+            body.appendChild(batchLink);
+            body.appendChild(batchesSection);
+
+            if (task.error_msg) {
+                const errDiv = document.createElement('div');
+                errDiv.style.cssText = 'margin-top:8px;color:#c0392b;font-size:0.85em';
+                errDiv.textContent = `Error: ${task.error_msg}`;
+                body.appendChild(errDiv);
+            }
+
+            card.appendChild(body);
+
+            // Toggle body on header click
+            header.onclick = () => body.classList.toggle('open');
+
+            return card;
+        }
+
+        function renderBatches(container, batches) {
+            if (!batches.length) {
+                container.innerHTML = '<div style="color:#888;font-size:0.85em">No batches recorded.</div>';
+                return;
+            }
+            const table = document.createElement('table');
+            table.className = 'batch-table';
+            table.innerHTML = `
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Batch ID</th>
+                        <th>Queries</th>
+                        <th>Valid / Invalid</th>
+                        <th>Status</th>
+                        <th>Finished</th>
+                    </tr>
+                </thead>
+            `;
+            const tbody = document.createElement('tbody');
+            batches.forEach(b => {
+                const queries  = b.queries  || [];
+                const results  = b.results  || {};
+                const validN   = Object.values(results).filter(r => r.is_valid).length;
+                const invalidN = Object.values(results).filter(r => !r.is_valid).length;
+
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${b.batch_index}</td>
+                    <td style="font-family:monospace;font-size:0.82em">${b.batch_id}</td>
+                    <td>${queries.length}</td>
+                    <td><span style="color:green">${validN}</span> / <span style="color:#c0392b">${invalidN}</span></td>
+                    <td><span class="job-status status-${b.status}">${b.status}</span></td>
+                    <td>${b.finished_at || '—'}</td>
+                `;
+                // Expandable query detail
+                tr.style.cursor = 'pointer';
+                tr.title = 'Click to see query results';
+                tr.onclick = () => {
+                    const existingDetail = tr.nextSibling;
+                    if (existingDetail && existingDetail.classList && existingDetail.classList.contains('batch-detail-row')) {
+                        existingDetail.remove(); return;
+                    }
+                    const detailRow = document.createElement('tr');
+                    detailRow.className = 'batch-detail-row';
+                    const td = document.createElement('td');
+                    td.colSpan = 6;
+                    td.style.padding = '8px 12px';
+                    td.style.background = '#f9f9fb';
+
+                    if (!Object.keys(results).length) {
+                        td.textContent = 'No results recorded.';
+                    } else {
+                        queries.forEach(q => {
+                            const r = results[q] || {};
+                            const chip = document.createElement('span');
+                            chip.className = 'query-chip' + (r.is_valid === false ? ' invalid' : '');
+                            chip.title = r.reason || '';
+                            chip.textContent = q;
+                            td.appendChild(chip);
+                        });
+                    }
+                    detailRow.appendChild(td);
+                    tr.after(detailRow);
+                };
+                tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            container.innerHTML = '';
+            container.appendChild(table);
+        }
+
+        function closeJobDetail() {
+            const panel = document.getElementById('jobDetailPanel');
+            panel.style.display = 'none';
+            document.getElementById('detailThemes').innerHTML = '';
+            document.getElementById('detailMeta').textContent = '';
+        }
+
+        function safeParseJSON(val, fallback) {
+            if (!val) return fallback;
+            if (typeof val !== 'string') return val;
+            try { return JSON.parse(val); } catch { return fallback; }
+        }
+    </script>
+</body>
+</html>

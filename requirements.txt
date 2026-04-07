@@ -1,0 +1,9 @@
+pandas
+openai
+sentence-transformers
+faiss-cpu
+Levenshtein
+python-dotenv
+fastapi
+uvicorn
+python-multipart
