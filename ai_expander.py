@@ -11,12 +11,19 @@ logger = get_logger(__name__)
 
 class AIExpander:
     def __init__(self):
-        self.client = AzureOpenAI(
+        self.deployment_name = config.AZURE_OPENAI_DEPLOYMENT_NAME
+
+    def _get_client(self) -> AzureOpenAI:
+        """Return a new AzureOpenAI client per call.
+
+        The openai SDK's httpx connection pool is not safe to share across threads.
+        Creating a lightweight client per request avoids cross-thread deadlocks.
+        """
+        return AzureOpenAI(
             api_key=config.AZURE_OPENAI_API_KEY,
             api_version=config.AZURE_OPENAI_API_VERSION,
-            azure_endpoint=config.AZURE_OPENAI_ENDPOINT
+            azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
         )
-        self.deployment_name = config.AZURE_OPENAI_DEPLOYMENT_NAME
 
     def _expand_japanese_space_variants(self, keywords: list) -> list:
         """
@@ -79,9 +86,59 @@ class AIExpander:
         {f'- Examples in {primary_lang}: {example_str}' if example_str else ''}
         """
 
-    def expand_search_theme(self, search_theme, market="Australia", job_id=None, theme_id=None):
+    def expand_search_themes_parallel(
+        self,
+        brands: list,
+        market: str = "Australia",
+        max_workers: int = 10,
+        job_id=None,
+        theme_id=None,
+    ) -> list:
+        """Expand multiple brands concurrently and merge results into a single seed list.
+
+        Each brand is submitted to expand_search_theme in parallel. Results are
+        flattened and deduplicated (order-preserving) before being returned.
         """
-        Expands a search theme into a list of related keywords.
+        ctx = {"job_id": job_id, "theme_id": theme_id}
+        logger.info(
+            f"Multi-brand expansion start | brands={brands} market={market}",
+            extra=ctx,
+        )
+
+        all_keywords = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_brand = {
+                executor.submit(
+                    self.expand_search_theme, brand, market, job_id, theme_id
+                ): brand
+                for brand in brands
+            }
+            for future in concurrent.futures.as_completed(future_to_brand):
+                brand = future_to_brand[future]
+                try:
+                    keywords = future.result()
+                    all_keywords.extend(keywords)
+                except Exception as exc:
+                    logger.error(
+                        f"Multi-brand expansion failed for brand='{brand}': {exc}",
+                        extra=ctx,
+                    )
+
+        # Deduplicate while preserving insertion order
+        seen = {}
+        for kw in all_keywords:
+            if kw not in seen:
+                seen[kw] = None
+        merged = list(seen.keys())
+
+        logger.info(
+            f"Multi-brand expansion done | brands={len(brands)} unique_keywords={len(merged)}",
+            extra=ctx,
+        )
+        return merged
+
+    def expand_search_theme(self, search_theme, market="Australia", job_id=None, theme_id=None):
+        """Expands a search theme into a list of related keywords.
         Returns a list of strings.
         """
         ctx = {"job_id": job_id, "theme_id": theme_id}
@@ -130,7 +187,7 @@ class AIExpander:
         logger.info(f"Expansion request | theme='{search_theme}' market={market} prompt_len={len(full_prompt)}", extra=ctx)
 
         try:
-            response = self.client.chat.completions.create(
+            response = self._get_client().chat.completions.create(
                 model=self.deployment_name,
                 messages=[{"role": "user", "content": full_prompt}],
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS_EXPAND
@@ -240,7 +297,7 @@ class AIExpander:
         logger.debug(f"Validation batch {batch_index} start | brand='{brand}' queries={len(batch_queries)}", extra=ctx)
 
         try:
-            response = self.client.chat.completions.create(
+            response = self._get_client().chat.completions.create(
                 model=self.deployment_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -299,7 +356,7 @@ class AIExpander:
         if not queries:
             return {}
 
-        batch_size = 10
+        batch_size = 25
         batches = [(queries[i:i + batch_size], i // batch_size)
                    for i in range(0, len(queries), batch_size)]
 
@@ -309,7 +366,7 @@ class AIExpander:
         )
 
         all_results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
             future_to_batch = {
                 executor.submit(
                     self._validate_batch, brand, batch, idx, market, job_id, theme_id

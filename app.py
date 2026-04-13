@@ -28,8 +28,8 @@ expander    = None
 def get_db_manager(market: str) -> DBManager:
     """Get or create DBManager for the specified market (cached)."""
     if market not in db_managers:
-        logger.info(f"Initializing DBManager for market: {market}")
-        db_manager = DBManager(market=market)
+        logger.info(f"Initializing DBManager for market: {market} (azure={config.USE_AZURE_DATASOURCE})")
+        db_manager = DBManager(market=market, use_azure=config.USE_AZURE_DATASOURCE)
         db_manager.initialize_db()
         db_managers[market] = db_manager
     return db_managers[market]

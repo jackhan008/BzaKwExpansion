@@ -16,6 +16,9 @@ logger = get_logger(__name__)
 def process_theme(theme, expander, matcher, market="Australia", job_id=None, theme_id=None):
     """
     Full pipeline for a single theme: Expand → Match → Validate.
+
+    theme   : str or list[str]. When a list is provided, all brands are expanded
+              concurrently and their keywords are merged before matching.
     job_id  : ID of the parent expansion job (shared across all themes in the request)
     theme_id: ID unique to this theme within the job  (format: "<job_id>-t<n>")
     """
@@ -24,15 +27,30 @@ def process_theme(theme, expander, matcher, market="Australia", job_id=None, the
     if theme_id is None:
         theme_id = f"{job_id}-t0"
 
-    ctx = {"job_id": job_id, "theme_id": theme_id}
-    logger.info(f"Theme start | theme='{theme}' market={market}", extra=ctx)
+    # Normalise: always work with a list internally; derive a display name for logging
+    if isinstance(theme, list):
+        brands = theme
+        display_name = " | ".join(brands)
+    else:
+        brands = [theme]
+        display_name = theme
 
-    job_store.create_theme_task(theme_id=theme_id, job_id=job_id, theme=theme, market=market)
+    ctx = {"job_id": job_id, "theme_id": theme_id}
+    logger.info(f"Theme start | theme='{display_name}' market={market}", extra=ctx)
+
+    job_store.create_theme_task(theme_id=theme_id, job_id=job_id, theme=display_name, market=market)
 
     try:
         # Step 1: AI Expansion
         logger.info("Step 1/3 Expansion start", extra=ctx)
-        expanded_keywords = expander.expand_search_theme(theme, market=market, job_id=job_id, theme_id=theme_id)
+        if len(brands) > 1:
+            expanded_keywords = expander.expand_search_themes_parallel(
+                brands, market=market, job_id=job_id, theme_id=theme_id
+            )
+        else:
+            expanded_keywords = expander.expand_search_theme(
+                brands[0], market=market, job_id=job_id, theme_id=theme_id
+            )
         job_store.update_theme_expanded(theme_id=theme_id, expanded_keywords=expanded_keywords)
 
         # Step 2: Matching

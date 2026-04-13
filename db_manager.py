@@ -4,25 +4,39 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import os
+import struct
 import config
 
+
 class DBManager:
-    def __init__(self, market="Australia"):
-        """Initialize DBManager for a specific market."""
+    def __init__(self, market="Australia", use_azure=False):
+        """Initialize DBManager for a specific market.
+
+        use_azure=True  -> Hard Match via Azure SQL, Vector Match via Azure AI Search.
+        use_azure=False -> Hard Match via local SQLite, Vector Match via local FAISS.
+        """
         self.market = market
+        self.use_azure = use_azure
         self._load_market_config(market)
-        
-        # Initialize Embedding Function based on market
-        embedding_model_name = config.MARKET_EMBEDDING_MODEL.get(
-            market, config.EMBEDDING_MODEL_NAME
-        )
-        self.embedding_model = SentenceTransformer(embedding_model_name)
-        
-        # Load FAISS Index if exists
-        if os.path.exists(self.vector_db_path):
-            self.index = faiss.read_index(self.vector_db_path)
+
+        if not use_azure:
+            # Local mode: load embedding model and FAISS index
+            embedding_model_name = config.MARKET_EMBEDDING_MODEL.get(
+                market, config.EMBEDDING_MODEL_NAME
+            )
+            self.embedding_model = SentenceTransformer(embedding_model_name)
+
+            if os.path.exists(self.vector_db_path):
+                self.index = faiss.read_index(self.vector_db_path)
+            else:
+                self.index = None
         else:
+            # Azure mode: no local embedding model or FAISS index needed
+            self.embedding_model = None
             self.index = None
+            self._credential = config.get_azure_credential()
+            self._search_index = config.MARKET_SEARCH_INDEX.get(market, f"keywords-{market.lower()}")
+
     
     def _load_market_config(self, market):
         """Load file paths for the specified market."""
@@ -47,7 +61,12 @@ class DBManager:
             print(f"Warning: No data files configured for market '{market}'. Using {fallback_market} data.")
 
     def initialize_db(self):
-        """Initializes SQLite and FAISS Index from CSV if not already populated."""
+        """Initializes SQLite and FAISS Index from CSV if not already populated.
+
+        In Azure mode this is a no-op — data lives in the cloud.
+        """
+        if self.use_azure:
+            return
         
         print(f"Checking database for market: {self.market}")
         print(f"  SQLite: {self.sqlite_path}")
@@ -107,9 +126,12 @@ class DBManager:
 
     def query_sqlite_contains(self, term):
         """Finds queries containing the term (Hard Match).
-        
-        For Japanese market, also handles full-width spaces (U+3000).
+
+        Routes to Azure SQL or local SQLite based on use_azure flag.
         """
+        if self.use_azure:
+            return self._query_azure_sql_contains(term)
+
         conn = sqlite3.connect(self.sqlite_path)
         # Remove both half-width and full-width spaces from the search term
         clean_term = term.replace(" ", "").replace("\u3000", "")
@@ -133,7 +155,13 @@ class DBManager:
         return df
 
     def query_vector_similarity(self, term, n_results=100):
-        """Finds semantically similar queries using FAISS."""
+        """Finds semantically similar queries.
+
+        Routes to Azure AI Search or local FAISS based on use_azure flag.
+        """
+        if self.use_azure:
+            return self._query_azure_search_similarity(term, n_results)
+
         if self.index is None:
              # Try to load if not loaded
              if os.path.exists(self.vector_db_path):
@@ -171,5 +199,119 @@ class DBManager:
         # matcher.py expects: similarity = 1 - distance
         # So: distance = 1 - similarity
         df_results['distance'] = df_results['id'].map(lambda x: 1 - id_to_score.get(x, 0))
-        
+
         return df_results
+
+    # ------------------------------------------------------------------
+    # Azure backend — private methods
+    # ------------------------------------------------------------------
+
+    def _get_azure_sql_connection(self):
+        """Return a pyodbc connection to Azure SQL using token-based auth."""
+        import pyodbc
+        token = self._credential.get_token("https://database.windows.net/.default").token
+        token_bytes = token.encode("utf-16-le")
+        token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+        conn_str = (
+            f"Driver={{{config.AZURE_SQL_DRIVER}}};"
+            f"Server={config.AZURE_SQL_SERVER},{config.AZURE_SQL_PORT};"
+            f"Database={config.AZURE_SQL_DATABASE};"
+            "Encrypt=yes;TrustServerCertificate=no;"
+        )
+        SQL_COPT_SS_ACCESS_TOKEN = 1256
+        return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+
+    def _query_azure_sql_contains(self, term) -> pd.DataFrame:
+        """Hard Match via Azure SQL — parameterized query, returns same schema as SQLite path.
+
+        Uses a dedicated per-market table if configured, otherwise filters the default
+        table by TargetMarket code. Field mapping:
+            Query  -> normalized_query
+            Srpv   -> SRPV
+            (AdClick and revenue not available, defaulted to 0)
+        """
+        clean_term = term.replace(" ", "").replace("\u3000", "")
+
+        # Resolve table and optional market filter
+        table = config.AZURE_SQL_MARKET_TABLE.get(self.market) or config.AZURE_SQL_TABLE_DEFAULT
+        market_code = config.AZURE_SQL_MARKET_CODE.get(self.market)
+        dedicated_table = bool(config.AZURE_SQL_MARKET_TABLE.get(self.market))
+
+        if self.market == "Japan":
+            where_query = "REPLACE(REPLACE(Query, ' ', ''), N'\u3000', '') LIKE ?"
+        else:
+            where_query = "REPLACE(Query, ' ', '') LIKE ?"
+
+        if dedicated_table:
+            sql = f"SELECT Query, Srpv FROM dbo.[{table}] WHERE {where_query}"
+            params = (f"%{clean_term}%",)
+        else:
+            sql = f"SELECT Query, Srpv FROM dbo.[{table}] WHERE TargetMarket = ? AND {where_query}"
+            params = (market_code, f"%{clean_term}%")
+
+        conn = self._get_azure_sql_connection()
+        df = pd.read_sql(sql, conn, params=params)
+        conn.close()
+
+        # Align to expected schema
+        df = df.rename(columns={"Query": "normalized_query", "Srpv": "SRPV"})
+        df["AdClick"] = 0
+        df["revenue"] = 0
+        return df
+
+    def _query_azure_search_similarity(self, term, n_results=100) -> pd.DataFrame:
+        """Vector Match via Azure AI Search — full-text / semantic search on keyword text.
+
+        No local embedding is generated; the term is passed directly to AI Search.
+        Auth: uses API key if AZURE_SEARCH_API_KEY is set, otherwise Azure credential (RBAC).
+        Results are returned in the same schema as the FAISS path so matcher.py
+        requires no changes:  [id, normalized_query, SRPV, AdClick, revenue, distance]
+        distance = 1 - score  (AI Search returns relevance scores 0..1)
+        """
+        from azure.search.documents import SearchClient
+        from azure.core.credentials import AzureKeyCredential
+
+        if config.AZURE_SEARCH_API_KEY:
+            credential = AzureKeyCredential(config.AZURE_SEARCH_API_KEY)
+        else:
+            credential = self._credential
+
+        client = SearchClient(
+            endpoint=config.AZURE_SEARCH_ENDPOINT,
+            index_name=self._search_index,
+            credential=credential,
+            api_version=config.AZURE_SEARCH_API_VERSION,
+        )
+
+        qf   = config.AZURE_SEARCH_QUERY_FIELD
+        srpv = config.AZURE_SEARCH_SRPV_FIELD
+
+        # Only select fields that exist in the index; AdClick/revenue default to 0
+        select_fields = [qf]
+        if srpv:
+            select_fields.append(srpv)
+
+        results = client.search(
+            search_text=term,
+            select=select_fields,
+            top=n_results,
+        )
+
+        rows = []
+        for i, r in enumerate(results):
+            score = r.get("@search.score", 0.0)
+            rows.append({
+                "id":               i,
+                "normalized_query": r.get(qf, ""),
+                "SRPV":             r.get(srpv, 0) if srpv else 0,
+                "AdClick":          0,
+                "revenue":          0,
+                "distance":         1 - score,
+            })
+
+        if not rows:
+            return pd.DataFrame(
+                columns=["id", "normalized_query", "SRPV", "AdClick", "revenue", "distance"]
+            )
+        return pd.DataFrame(rows)
+
