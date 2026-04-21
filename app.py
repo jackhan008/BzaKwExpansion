@@ -11,7 +11,7 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 
 from db_manager import DBManager
-from ai_expander import AIExpander
+from ai_expander import AIExpander, fetch_brand_context
 from matcher import QueryMatcher
 from main import process_theme, process_themes_parallel
 from logger import get_logger
@@ -61,6 +61,8 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 class ExpandRequest(BaseModel):
     themes: List[str]
     market: Optional[str] = "Australia"
+    device_types: Optional[List[str]] = ["pc"]   # "pc", "mobile", or both
+    landing_pages: Optional[dict] = None   # {theme: url}
 
 
 class ThemeDetail(BaseModel):
@@ -104,11 +106,20 @@ async def expand_themes_stream(request: ExpandRequest):
 
     job_id = uuid.uuid4().hex[:8]
     market = request.market or config.DEFAULT_MARKET
+    device_types = request.device_types or ["pc"]
     themes = [t for t in request.themes if t.strip()]
     ctx    = {"job_id": job_id}
 
-    logger.info(f"Stream job received | themes={themes} market={market}", extra=ctx)
+    logger.info(f"Stream job received | themes={themes} market={market} device_types={device_types}", extra=ctx)
     matcher = get_matcher(market)
+
+    # Fetch landing page context for each theme that has a URL
+    brand_contexts = {}
+    if request.landing_pages:
+        for theme, url in request.landing_pages.items():
+            if url and theme in themes:
+                logger.info(f"Fetching landing page for theme='{theme}' url={url}", extra=ctx)
+                brand_contexts[theme] = fetch_brand_context(url)
 
     async def event_generator():
         # First line: announce job_id to the client
@@ -118,7 +129,7 @@ async def expand_themes_stream(request: ExpandRequest):
         loop = asyncio.get_running_loop()
 
         ordered_results = await loop.run_in_executor(
-            None, process_themes_parallel, themes, expander, matcher, market, 3, job_id
+            None, process_themes_parallel, themes, expander, matcher, market, 3, job_id, brand_contexts, device_types
         )
 
         for theme, df, expanded_keywords in ordered_results:
@@ -162,17 +173,24 @@ async def expand_themes(request: ExpandRequest):
 
     job_id = uuid.uuid4().hex[:8]
     market = request.market or config.DEFAULT_MARKET
+    device_types = request.device_types or ["pc"]
     themes = [t for t in request.themes if t.strip()]
     ctx    = {"job_id": job_id}
 
-    logger.info(f"Expand job received | themes={themes} market={market}", extra=ctx)
+    logger.info(f"Expand job received | themes={themes} market={market} device_types={device_types}", extra=ctx)
     matcher = get_matcher(market)
+
+    brand_contexts = {}
+    if request.landing_pages:
+        for theme, url in request.landing_pages.items():
+            if url and theme in themes:
+                brand_contexts[theme] = fetch_brand_context(url)
 
     all_results_dfs = []
     theme_details   = []
 
     for theme, df, expanded_keywords in process_themes_parallel(
-        themes, expander, matcher, market, job_id=job_id
+        themes, expander, matcher, market, job_id=job_id, brand_contexts=brand_contexts, device_types=device_types
     ):
         match_count = len(df) if not df.empty else 0
         theme_details.append(ThemeDetail(

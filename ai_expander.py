@@ -5,13 +5,47 @@ import config
 import concurrent.futures
 from logger import get_logger
 import job_store
+try:
+    import httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
 
 logger = get_logger(__name__)
+
+
+def fetch_brand_context(url: str, timeout: int = 10) -> str:
+    """Fetch a landing page and return a short brand description (plain text, ≤300 chars).
+
+    Returns empty string on any failure so callers can treat it as optional.
+    """
+    if not url or not _HTTPX_AVAILABLE:
+        return ""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; BZABot/1.0)"}
+        resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+        text = resp.text
+
+        # Strip tags with a simple regex-free approach: find visible text blocks
+        import re
+        # Remove script/style blocks
+        text = re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # Remove all tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Take first 300 chars as brand context summary
+        return text[:300]
+    except Exception as e:
+        logger.warning(f"fetch_brand_context failed for {url}: {e}")
+        return ""
 
 
 class AIExpander:
     def __init__(self):
         self.deployment_name = config.AZURE_OPENAI_DEPLOYMENT_NAME
+        self.deployment_name_expand = config.AZURE_OPENAI_DEPLOYMENT_NAME_EXPAND
 
     def _get_client(self) -> AzureOpenAI:
         """Return a new AzureOpenAI client per call.
@@ -93,12 +127,9 @@ class AIExpander:
         max_workers: int = 10,
         job_id=None,
         theme_id=None,
+        brand_context: str = "",
     ) -> list:
-        """Expand multiple brands concurrently and merge results into a single seed list.
-
-        Each brand is submitted to expand_search_theme in parallel. Results are
-        flattened and deduplicated (order-preserving) before being returned.
-        """
+        """Expand multiple brands concurrently and merge results into a single seed list."""
         ctx = {"job_id": job_id, "theme_id": theme_id}
         logger.info(
             f"Multi-brand expansion start | brands={brands} market={market}",
@@ -109,7 +140,7 @@ class AIExpander:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_brand = {
                 executor.submit(
-                    self.expand_search_theme, brand, market, job_id, theme_id
+                    self.expand_search_theme, brand, market, job_id, theme_id, brand_context
                 ): brand
                 for brand in brands
             }
@@ -137,7 +168,7 @@ class AIExpander:
         )
         return merged
 
-    def expand_search_theme(self, search_theme, market="Australia", job_id=None, theme_id=None):
+    def expand_search_theme(self, search_theme, market="Australia", job_id=None, theme_id=None, brand_context=""):
         """Expands a search theme into a list of related keywords.
         Returns a list of strings.
         """
@@ -184,11 +215,13 @@ class AIExpander:
         """
 
         full_prompt = f"{system_prompt}\n\nUser Input: {search_theme}"
+        if brand_context:
+            full_prompt += f"\n\n**IMPORTANT — Brand Identity Context** (from the brand's official landing page — use this to determine what this brand actually does BEFORE generating any keywords):\n{brand_context}"
         logger.info(f"Expansion request | theme='{search_theme}' market={market} prompt_len={len(full_prompt)}", extra=ctx)
 
         try:
             response = self._get_client().chat.completions.create(
-                model=self.deployment_name,
+                model=self.deployment_name_expand,
                 messages=[{"role": "user", "content": full_prompt}],
                 max_completion_tokens=config.MAX_COMPLETION_TOKENS_EXPAND
             )
@@ -249,11 +282,17 @@ class AIExpander:
             logger.exception(f"Expansion exception: {e}", extra=ctx)
             return [search_theme]
 
-    def _validate_batch(self, brand, batch_queries, batch_index, market="Australia", job_id=None, theme_id=None):
+    def _validate_batch(self, brand, batch_queries, batch_index, market="Australia", job_id=None, theme_id=None, brand_keywords=None, brand_context=""):
         """Validate a single batch of queries against the brand."""
         ctx = {"job_id": job_id, "theme_id": theme_id}
         languages = config.MARKET_LANGUAGES.get(market, ["English"])
         lang_list = ", ".join(languages)
+
+        brand_context_section = ""
+        if brand_keywords:
+            brand_context_section += f"\nBrand Context (keywords generated for this brand, reflecting its actual business/product scope):\n{json.dumps(brand_keywords, ensure_ascii=False)}\n"
+        if brand_context:
+            brand_context_section += f"\nBrand Landing Page Summary:\n{brand_context}\n"
 
         system_prompt = f"""
             You are a query validation assistant for the {market} market.
@@ -269,6 +308,11 @@ class AIExpander:
             4. **Not a Comparison**: The query must not be comparing the Brand with another brand. (e.g. if Brand is "A", "A vs B" is invalid if B is another brand). If removing the Brand from the query leaves another Brand name (that is NOT the parent/owner), it is invalid.
             5. **Unrelated Specific Intent**: If the query combines the Brand with a term that creates a specific entity, location, or concept unrelated to the Brand's core business, it is **INVALID**. (e.g. If Brand is "AAMI" (insurance), "AAMI Park" is INVALID because it refers to a stadium, not the insurance service. If Brand is "Delta" (airline), "Delta Faucet" is INVALID).
             6. **Generic Brand Ambiguity**: If the Brand name is a common word (e.g. "Apple", "Orange", "Gap", "Booking"), the query is VALID if it is the brand name itself, its plural, or a clear reference to the brand's service. It is INVALID only if it clearly refers to a completely unrelated common object or concept (e.g. "apple pie" for brand "Apple"). For example, if Brand is "Booking", "bookings" is VALID.
+            7. **Product Model / Version Numbers**: If the Brand is known to release versioned or model-coded products (evident from the Brand Context keywords), then queries combining the brand name (in any language) with a model code MUST be treated as product model references and marked VALID. This includes:
+               - **Number-only suffix**: `[brand] + [number]` or `[number] + [brand]` (e.g. "苹果18", "苹果17", "17苹果" for Apple → iPhone 17/18)
+               - **Alphanumeric model codes**: `[brand] + [letter+number]` where the pattern matches the brand's known product lines (e.g. "苹果S10" → Apple Watch Series 10, "苹果M5"/"苹果M6" → MacBook with M5/M6 chip, "苹果SE4" → iPhone SE 4). Use the Brand Context keywords (e.g. "Apple Watch", "MacBook", "Apple iPhone") to confirm the brand uses such model codes.
+               - **Reversed order**: `[number/code] + [brand name]` is the same as `[brand name] + [number/code]` — treat identically.
+               Do NOT assume a model code belongs to a competitor brand unless you have strong evidence from the Brand Context (e.g. "苹果S10" should NOT be rejected as "Samsung S10" — in Chinese context 苹果 means Apple, so it refers to Apple Watch Series 10).
 
             For each query in the list, determine if it is "Valid" or "Invalid".
 
@@ -281,7 +325,7 @@ class AIExpander:
             }}
             """
 
-        user_prompt = f"Brand: {brand}\n\nInput Queries:\n{json.dumps(batch_queries)}"
+        user_prompt = f"Brand: {brand}{brand_context_section}\n\nInput Queries:\n{json.dumps(batch_queries)}"
         batch_results = {}
 
         batch_id = f"{theme_id}-b{batch_index}" if theme_id else None
@@ -347,7 +391,7 @@ class AIExpander:
 
         return batch_results
 
-    def validate_queries(self, brand, queries, market="Australia", job_id=None, theme_id=None):
+    def validate_queries(self, brand, queries, market="Australia", job_id=None, theme_id=None, brand_keywords=None, brand_context=""):
         """
         Validate all queries in parallel batches.
         Returns dict: query -> {"is_valid": bool, "reason": str}
@@ -369,7 +413,7 @@ class AIExpander:
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
             future_to_batch = {
                 executor.submit(
-                    self._validate_batch, brand, batch, idx, market, job_id, theme_id
+                    self._validate_batch, brand, batch, idx, market, job_id, theme_id, brand_keywords, brand_context
                 ): idx
                 for batch, idx in batches
             }

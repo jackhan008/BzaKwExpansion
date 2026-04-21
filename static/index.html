@@ -78,6 +78,24 @@
             box-sizing: border-box;
             margin-bottom: 20px;
         }
+        .device-type-group {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .device-type-group label {
+            font-weight: normal;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            color: #333;
+        }
+        .device-type-group input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
         .hint {
             font-size: 0.9em;
             color: #666;
@@ -300,6 +318,14 @@
             </div>
 
             <div class="form-group">
+                <label>Device Type:</label>
+                <div class="device-type-group">
+                    <label><input type="checkbox" id="dt-pc" value="pc" checked> PC</label>
+                    <label><input type="checkbox" id="dt-mobile" value="mobile"> Mobile</label>
+                </div>
+            </div>
+
+            <div class="form-group">
                 <label for="themes">Enter Search Themes (one per line):</label>
                 <textarea id="themes" placeholder="e.g.&#10;Nike&#10;Running Shoes&#10;iPhone 15"></textarea>
                 <div class="hint">Each line is processed as a separate search theme.</div>
@@ -358,6 +384,13 @@
         let currentCsvContent = null;
         let marketLanguages   = {};
         let selectedMarket    = 'Australia';
+
+        function getSelectedDeviceTypes() {
+            const types = [];
+            if (document.getElementById('dt-pc').checked)     types.push('pc');
+            if (document.getElementById('dt-mobile').checked) types.push('mobile');
+            return types.length ? types : ['pc'];  // fallback to pc if nothing checked
+        }
 
         document.addEventListener('DOMContentLoaded', loadMarkets);
 
@@ -423,7 +456,7 @@
                 const response = await fetch('/api/expand_stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ themes, market: selectedMarket })
+                    body: JSON.stringify({ themes, market: selectedMarket, device_types: getSelectedDeviceTypes() })
                 });
                 if (!response.ok) throw new Error(`Server error: ${response.statusText}`);
 

@@ -3,6 +3,7 @@
 
 # Log files
 logs/
+*.log
 
 # Python
 __pycache__/
@@ -29,4 +30,4 @@ env/
 # OS
 .DS_Store
 Thumbs.db
-Data/
+Data/*

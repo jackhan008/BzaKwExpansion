@@ -1,10 +1,12 @@
 import sqlite3
+import concurrent.futures
 import pandas as pd
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import os
 import struct
+import threading
 import config
 
 
@@ -35,7 +37,18 @@ class DBManager:
             self.embedding_model = None
             self.index = None
             self._credential = config.get_azure_credential()
-            self._search_index = config.MARKET_SEARCH_INDEX.get(market, f"keywords-{market.lower()}")
+            # _search_indexes_by_device: {device_type: index_name}
+            # e.g. {"pc": "kw-...-pc", "mobile": "kw-...-mobile"} or {"pc": "keywords-au"}
+            idx_config = config.MARKET_SEARCH_INDEX.get(market, {"pc": f"keywords-{market.lower()}"})
+            if isinstance(idx_config, dict):
+                self._search_indexes_by_device = idx_config
+            elif isinstance(idx_config, list):
+                # legacy list format — treat as pc + mobile in order
+                devices = ["pc", "mobile"]
+                self._search_indexes_by_device = {devices[i]: v for i, v in enumerate(idx_config)}
+            else:
+                self._search_indexes_by_device = {"pc": idx_config}
+            self._local = threading.local()   # thread-local Azure SQL connection cache
 
     
     def _load_market_config(self, market):
@@ -124,13 +137,14 @@ class DBManager:
         faiss.write_index(self.index, self.vector_db_path)
         print("FAISS Index initialized and saved.")
 
-    def query_sqlite_contains(self, term):
+    def query_sqlite_contains(self, term, device_types=None):
         """Finds queries containing the term (Hard Match).
 
         Routes to Azure SQL or local SQLite based on use_azure flag.
+        device_types: list of device types to filter (Azure mode only); None means ["pc"].
         """
         if self.use_azure:
-            return self._query_azure_sql_contains(term)
+            return self._query_azure_sql_contains(term, device_types or ["pc"])
 
         conn = sqlite3.connect(self.sqlite_path)
         # Remove both half-width and full-width spaces from the search term
@@ -138,29 +152,24 @@ class DBManager:
         
         # For Japanese market, need to handle both space types in the database
         # Use nested REPLACE to remove both half-width space and full-width space (U+3000)
-        if self.market == "Japan":
-            query = f"""
-            SELECT normalized_query, SRPV, AdClick, revenue 
-            FROM keywords 
-            WHERE REPLACE(REPLACE(normalized_query, ' ', ''), '　', '') LIKE '%{clean_term}%'
-            """
-        else:
-            query = f"""
-            SELECT normalized_query, SRPV, AdClick, revenue 
-            FROM keywords 
-            WHERE REPLACE(normalized_query, ' ', '') LIKE '%{clean_term}%'
+        query = f"""
+            SELECT normalized_query, SRPV, AdClick, revenue
+            FROM keywords
+            WHERE normalized_query LIKE '{term}%'
+               OR normalized_query LIKE '%{term}'
             """
         df = pd.read_sql_query(query, conn)
         conn.close()
         return df
 
-    def query_vector_similarity(self, term, n_results=100):
+    def query_vector_similarity(self, term, n_results=100, device_types=None):
         """Finds semantically similar queries.
 
         Routes to Azure AI Search or local FAISS based on use_azure flag.
+        device_types: list of device types to filter (Azure mode only); None means ["pc"].
         """
         if self.use_azure:
-            return self._query_azure_search_similarity(term, n_results)
+            return self._query_azure_search_similarity(term, n_results, device_types or ["pc"])
 
         if self.index is None:
              # Try to load if not loaded
@@ -207,65 +216,79 @@ class DBManager:
     # ------------------------------------------------------------------
 
     def _get_azure_sql_connection(self):
-        """Return a pyodbc connection to Azure SQL using token-based auth."""
-        import pyodbc
-        token = self._credential.get_token("https://database.windows.net/.default").token
-        token_bytes = token.encode("utf-16-le")
-        token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
-        conn_str = (
-            f"Driver={{{config.AZURE_SQL_DRIVER}}};"
-            f"Server={config.AZURE_SQL_SERVER},{config.AZURE_SQL_PORT};"
-            f"Database={config.AZURE_SQL_DATABASE};"
-            "Encrypt=yes;TrustServerCertificate=no;"
-        )
-        SQL_COPT_SS_ACCESS_TOKEN = 1256
-        return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+        """Return a thread-local pyodbc connection to Azure SQL (token-based auth).
 
-    def _query_azure_sql_contains(self, term) -> pd.DataFrame:
+        The connection is created once per thread and reused across queries.
+        A lightweight liveness check (SELECT 1) recycles stale connections.
+        """
+        import pyodbc
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except Exception:
+                conn = None
+        if conn is None:
+            token = self._credential.get_token("https://database.windows.net/.default").token
+            token_bytes = token.encode("utf-16-le")
+            token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+            conn_str = (
+                f"Driver={{{config.AZURE_SQL_DRIVER}}};"
+                f"Server={config.AZURE_SQL_SERVER},{config.AZURE_SQL_PORT};"
+                f"Database={config.AZURE_SQL_DATABASE};"
+                "Encrypt=yes;TrustServerCertificate=no;"
+            )
+            SQL_COPT_SS_ACCESS_TOKEN = 1256
+            conn = pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+            self._local.conn = conn
+        return conn
+
+    def _query_azure_sql_contains(self, term, device_types) -> pd.DataFrame:
         """Hard Match via Azure SQL — parameterized query, returns same schema as SQLite path.
 
-        Uses a dedicated per-market table if configured, otherwise filters the default
-        table by TargetMarket code. Field mapping:
-            Query  -> normalized_query
-            Srpv   -> SRPV
-            (AdClick and revenue not available, defaulted to 0)
+        Filters by TargetMarket and DeviceType.
+        Field mapping: Query -> normalized_query, Srpv -> SRPV.
+        AdClick and revenue are not available in this table, defaulted to 0.
         """
-        clean_term = term.replace(" ", "").replace("\u3000", "")
-
-        # Resolve table and optional market filter
-        table = config.AZURE_SQL_MARKET_TABLE.get(self.market) or config.AZURE_SQL_TABLE_DEFAULT
+        clean_term  = term.replace(" ", "").replace("\u3000", "")
+        table       = config.AZURE_SQL_TABLE_BY_MARKET.get(self.market, config.AZURE_SQL_TABLE_DEFAULT)
         market_code = config.AZURE_SQL_MARKET_CODE.get(self.market)
-        dedicated_table = bool(config.AZURE_SQL_MARKET_TABLE.get(self.market))
 
-        if self.market == "Japan":
-            where_query = "REPLACE(REPLACE(Query, ' ', ''), N'\u3000', '') LIKE ?"
-        else:
-            where_query = "REPLACE(Query, ' ', '') LIKE ?"
+        placeholders = ", ".join("?" * len(device_types))
 
-        if dedicated_table:
-            sql = f"SELECT Query, Srpv FROM dbo.[{table}] WHERE {where_query}"
-            params = (f"%{clean_term}%",)
+        if self.market in config.AZURE_SQL_TABLE_BY_MARKET:
+            # Market-specific table (e.g. China): prefix-only match until index is ready.
+            sql = (
+                f"SELECT Query, Srpv FROM dbo.[{table}] "
+                f"WHERE DeviceType IN ({placeholders}) AND Query LIKE ?"
+            )
+            params = (*device_types, f"{clean_term}%")
         else:
-            sql = f"SELECT Query, Srpv FROM dbo.[{table}] WHERE TargetMarket = ? AND {where_query}"
-            params = (market_code, f"%{clean_term}%")
+            # Default table has QueryClean persisted computed column (spaces stripped).
+            sql = (
+                f"SELECT Query, Srpv FROM dbo.[{table}] "
+                f"WHERE TargetMarket = ? AND DeviceType IN ({placeholders}) "
+                f"AND QueryClean LIKE ?"
+            )
+            params = (market_code, *device_types, f"%{clean_term}%")
 
         conn = self._get_azure_sql_connection()
         df = pd.read_sql(sql, conn, params=params)
-        conn.close()
 
-        # Align to expected schema
         df = df.rename(columns={"Query": "normalized_query", "Srpv": "SRPV"})
         df["AdClick"] = 0
         df["revenue"] = 0
         return df
 
-    def _query_azure_search_similarity(self, term, n_results=100) -> pd.DataFrame:
+    def _query_azure_search_similarity(self, term, n_results=100, device_types=None) -> pd.DataFrame:
         """Vector Match via Azure AI Search — full-text / semantic search on keyword text.
 
+        Queries the indexes matching the requested device_types in parallel and merges results,
+        deduplicating by normalized_query (keeping the row with the lowest distance).
+        For markets with a single index (no device split), that index is always queried.
         No local embedding is generated; the term is passed directly to AI Search.
         Auth: uses API key if AZURE_SEARCH_API_KEY is set, otherwise Azure credential (RBAC).
-        Results are returned in the same schema as the FAISS path so matcher.py
-        requires no changes:  [id, normalized_query, SRPV, AdClick, revenue, distance]
+        Results: [id, normalized_query, SRPV, AdClick, revenue, distance]
         distance = 1 - score  (AI Search returns relevance scores 0..1)
         """
         from azure.search.documents import SearchClient
@@ -276,42 +299,62 @@ class DBManager:
         else:
             credential = self._credential
 
-        client = SearchClient(
-            endpoint=config.AZURE_SEARCH_ENDPOINT,
-            index_name=self._search_index,
-            credential=credential,
-            api_version=config.AZURE_SEARCH_API_VERSION,
-        )
-
         qf   = config.AZURE_SEARCH_QUERY_FIELD
         srpv = config.AZURE_SEARCH_SRPV_FIELD
+        select_fields = [qf] + ([srpv] if srpv else [])
 
-        # Only select fields that exist in the index; AdClick/revenue default to 0
-        select_fields = [qf]
-        if srpv:
-            select_fields.append(srpv)
+        # Resolve which indexes to query based on device_types
+        if device_types:
+            indexes_to_query = [
+                self._search_indexes_by_device[dt]
+                for dt in device_types
+                if dt in self._search_indexes_by_device
+            ]
+            if not indexes_to_query:
+                # Requested device type not available for this market → query all
+                indexes_to_query = list(self._search_indexes_by_device.values())
+        else:
+            indexes_to_query = list(self._search_indexes_by_device.values())
 
-        results = client.search(
-            search_text=term,
-            select=select_fields,
-            top=n_results,
-        )
+        def _query_one(index_name):
+            client = SearchClient(
+                endpoint=config.AZURE_SEARCH_ENDPOINT,
+                index_name=index_name,
+                credential=credential,
+                api_version=config.AZURE_SEARCH_API_VERSION,
+            )
+            results = client.search(
+                search_text=term,
+                select=select_fields,
+                top=n_results,
+            )
+            rows = []
+            for r in results:
+                score = r.get("@search.score", 0.0)
+                rows.append({
+                    "normalized_query": r.get(qf, ""),
+                    "SRPV":             r.get(srpv, 0) if srpv else 0,
+                    "AdClick":          0,
+                    "revenue":          0,
+                    "distance":         1 - score,
+                })
+            return rows
 
-        rows = []
-        for i, r in enumerate(results):
-            score = r.get("@search.score", 0.0)
-            rows.append({
-                "id":               i,
-                "normalized_query": r.get(qf, ""),
-                "SRPV":             r.get(srpv, 0) if srpv else 0,
-                "AdClick":          0,
-                "revenue":          0,
-                "distance":         1 - score,
-            })
+        # Query all selected indexes in parallel
+        all_rows = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(indexes_to_query)) as executor:
+            futures = [executor.submit(_query_one, idx) for idx in indexes_to_query]
+            for f in concurrent.futures.as_completed(futures):
+                all_rows.extend(f.result())
 
-        if not rows:
+        if not all_rows:
             return pd.DataFrame(
                 columns=["id", "normalized_query", "SRPV", "AdClick", "revenue", "distance"]
             )
-        return pd.DataFrame(rows)
+
+        df = pd.DataFrame(all_rows)
+        # Deduplicate by normalized_query, keep lowest distance (highest score)
+        df = df.sort_values("distance").drop_duplicates(subset="normalized_query").reset_index(drop=True)
+        df.insert(0, "id", df.index)
+        return df
 

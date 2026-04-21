@@ -13,7 +13,7 @@ import job_store
 logger = get_logger(__name__)
 
 
-def process_theme(theme, expander, matcher, market="Australia", job_id=None, theme_id=None):
+def process_theme(theme, expander, matcher, market="Australia", job_id=None, theme_id=None, brand_context="", device_types=None):
     """
     Full pipeline for a single theme: Expand → Match → Validate.
 
@@ -45,17 +45,17 @@ def process_theme(theme, expander, matcher, market="Australia", job_id=None, the
         logger.info("Step 1/3 Expansion start", extra=ctx)
         if len(brands) > 1:
             expanded_keywords = expander.expand_search_themes_parallel(
-                brands, market=market, job_id=job_id, theme_id=theme_id
+                brands, market=market, job_id=job_id, theme_id=theme_id, brand_context=brand_context
             )
         else:
             expanded_keywords = expander.expand_search_theme(
-                brands[0], market=market, job_id=job_id, theme_id=theme_id
+                brands[0], market=market, job_id=job_id, theme_id=theme_id, brand_context=brand_context
             )
         job_store.update_theme_expanded(theme_id=theme_id, expanded_keywords=expanded_keywords)
 
         # Step 2: Matching
         logger.info(f"Step 2/3 Matching start | keywords={len(expanded_keywords)}", extra=ctx)
-        results_df = matcher.process_expanded_keywords(expanded_keywords, job_id=job_id, theme_id=theme_id)
+        results_df = matcher.process_expanded_keywords(expanded_keywords, job_id=job_id, theme_id=theme_id, device_types=device_types)
         logger.info(f"Step 2/3 Matching done | matches={len(results_df)}", extra=ctx)
 
         matched_queries = results_df['normalized_query'].tolist() if not results_df.empty else []
@@ -71,7 +71,9 @@ def process_theme(theme, expander, matcher, market="Australia", job_id=None, the
             queries_to_validate = results_df['normalized_query'].unique().tolist()
             logger.info(f"Step 3/3 Validation start | unique_queries={len(queries_to_validate)}", extra=ctx)
             validation_results = expander.validate_queries(
-                theme, queries_to_validate, market=market, job_id=job_id, theme_id=theme_id
+                theme, queries_to_validate, market=market, job_id=job_id, theme_id=theme_id,
+                brand_keywords=expanded_keywords,
+                brand_context=brand_context,
             )
 
             results_df['AI_Valid'] = results_df['normalized_query'].map(
@@ -118,10 +120,12 @@ def process_theme(theme, expander, matcher, market="Australia", job_id=None, the
     return results_df, expanded_keywords
 
 
-def process_themes_parallel(themes, expander, matcher, market="Australia", max_workers=3, job_id=None):
+def process_themes_parallel(themes, expander, matcher, market="Australia", max_workers=3, job_id=None, brand_contexts=None, device_types=None):
     """
     Process multiple themes concurrently using a thread pool.
     Each theme runs its full pipeline (Expand → Match → Validate) in parallel.
+
+    brand_contexts: optional dict {theme: brand_context_str} for landing-page context injection.
 
     max_workers=3 is a conservative default: each theme internally spawns up to 10
     validation threads, so 3 themes × 10 = 30 concurrent Azure OpenAI calls at peak.
@@ -139,12 +143,13 @@ def process_themes_parallel(themes, expander, matcher, market="Australia", max_w
 
     results_map = {}
     final_status = "done"
+    brand_contexts = brand_contexts or {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_theme = {
             executor.submit(
                 process_theme, theme, expander, matcher, market,
-                job_id, f"{job_id}-t{i}"
+                job_id, f"{job_id}-t{i}", brand_contexts.get(theme, ""), device_types
             ): theme
             for i, theme in enumerate(themes)
         }

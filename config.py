@@ -10,10 +10,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-mini")  # Or gpt-35-turbo
+AZURE_OPENAI_DEPLOYMENT_NAME_EXPAND = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME_EXPAND", "gpt-5-mini")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
 
 # Token Limits for Azure OpenAI
-MAX_COMPLETION_TOKENS_EXPAND = 8000  # For keyword expansion
+MAX_COMPLETION_TOKENS_EXPAND = 4000  # For keyword expansion; reasoning model needs budget for CoT + output
 MAX_COMPLETION_TOKENS_VALIDATE = 8000  # For query validation
 
 # Database Configuration (Default - Australia)
@@ -139,23 +140,15 @@ AZURE_SQL_PORT     = int(os.getenv("AZURE_SQL_PORT", "1433"))
 
 # Azure SQL table configuration
 # Schema: Id, TargetMarket, DeviceType, Query, Srpv, WindowStartDate, WindowEndDate, ...
-# AZURE_SQL_TABLE_DEFAULT  -> used for most markets (filtered by TargetMarket column)
-# AZURE_SQL_TABLE_<MARKET> -> per-market override (dedicated table, no TargetMarket filter needed)
-AZURE_SQL_TABLE_DEFAULT = os.getenv("AZURE_SQL_TABLE_DEFAULT", "KeywordExpansion_30d")
-AZURE_SQL_MARKET_TABLE = {
-    "Australia":   os.getenv("AZURE_SQL_TABLE_AU",  None),
-    "Japan":       os.getenv("AZURE_SQL_TABLE_JP",  None),
-    "India":       os.getenv("AZURE_SQL_TABLE_IN",  None),
-    "Singapore":   os.getenv("AZURE_SQL_TABLE_SG",  None),
-    "Malaysia":    os.getenv("AZURE_SQL_TABLE_MY",  None),
-    "Thailand":    os.getenv("AZURE_SQL_TABLE_TH",  None),
-    "Philippines": os.getenv("AZURE_SQL_TABLE_PH",  None),
-    "Indonesia":   os.getenv("AZURE_SQL_TABLE_ID",  None),
-    "Vietnam":     os.getenv("AZURE_SQL_TABLE_VN",  None),
-    "China":       os.getenv("AZURE_SQL_TABLE_CN",  "KeywordExpansion_30d_cn_pc_srpv_gt_1000"),
+# All markets use the default table filtered by TargetMarket + DeviceType.
+AZURE_SQL_TABLE_DEFAULT = os.getenv("AZURE_SQL_TABLE_DEFAULT", "KeywordExpansion_30d_srpv_gt_50")
+
+# Per-market table overrides (optional). If a market is listed here, its queries go to this table.
+AZURE_SQL_TABLE_BY_MARKET = {
+    "China": os.getenv("AZURE_SQL_TABLE_CN", "KeywordExpansion_30d_query_cn_gt_50"),
 }
 
-# Market code mapping for TargetMarket column in the default table
+# Market code mapping for TargetMarket column
 AZURE_SQL_MARKET_CODE = {
     "Australia":   "au",
     "Japan":       "jp",
@@ -169,6 +162,7 @@ AZURE_SQL_MARKET_CODE = {
     "China":       "cn",
 }
 
+
 # Azure AI Search (Vector / Keyword Match) — query text sent directly, no local embeddings
 # Required when USE_AZURE_DATASOURCE=true
 # AZURE_SEARCH_ENDPOINT -> e.g. "https://bza-keywords-search.search.windows.net"
@@ -177,18 +171,27 @@ AZURE_SEARCH_API_VERSION = os.getenv("AZURE_SEARCH_API_VERSION", "2024-05-01-pre
 # Optional API key — if set, used instead of Azure credential (no RBAC required)
 AZURE_SEARCH_API_KEY     = os.getenv("AZURE_SEARCH_API_KEY")
 
-# Per-market AI Search index names (analogous to MARKET_DATA_FILES)
+# Per-market AI Search index names, keyed by device type.
+# Markets with a single index use {"pc": "..."} — queried for any device type request.
+# Markets with separate indexes per device type use {"pc": "...", "mobile": "..."}.
+# Values may be overridden via environment variables.
 MARKET_SEARCH_INDEX = {
-    "Australia":   os.getenv("AZURE_SEARCH_INDEX_AU",  "keywords-au"),
-    "Japan":       os.getenv("AZURE_SEARCH_INDEX_JP",  "keywords-jp"),
-    "India":       os.getenv("AZURE_SEARCH_INDEX_IN",  "keywords-in"),
-    "Singapore":   os.getenv("AZURE_SEARCH_INDEX_SG",  "keywords-sg"),
-    "Malaysia":    os.getenv("AZURE_SEARCH_INDEX_MY",  "keywords-my"),
-    "Thailand":    os.getenv("AZURE_SEARCH_INDEX_TH",  "keywords-th"),
-    "Philippines": os.getenv("AZURE_SEARCH_INDEX_PH",  "keywords-ph"),
-    "Indonesia":   os.getenv("AZURE_SEARCH_INDEX_ID",  "keywords-id"),
-    "Vietnam":     os.getenv("AZURE_SEARCH_INDEX_VN",  "keywords-vn"),
-    "China":       os.getenv("AZURE_SEARCH_INDEX_CN",  "keywords-cn"),
+    "Australia":   {"pc": os.getenv("AZURE_SEARCH_INDEX_AU", "keywords-au")},
+    "Japan": {
+        "pc":     os.getenv("AZURE_SEARCH_INDEX_JP_PC",     "kw-30d-query-jp-pc-top-300k"),
+        "mobile": os.getenv("AZURE_SEARCH_INDEX_JP_MOBILE", "kw-30d-query-jp-mobile-top-300k"),
+    },
+    "India":       {"pc": os.getenv("AZURE_SEARCH_INDEX_IN", "keywords-in")},
+    "Singapore":   {"pc": os.getenv("AZURE_SEARCH_INDEX_SG", "keywords-sg")},
+    "Malaysia":    {"pc": os.getenv("AZURE_SEARCH_INDEX_MY", "keywords-my")},
+    "Thailand":    {"pc": os.getenv("AZURE_SEARCH_INDEX_TH", "keywords-th")},
+    "Philippines": {"pc": os.getenv("AZURE_SEARCH_INDEX_PH", "keywords-ph")},
+    "Indonesia":   {"pc": os.getenv("AZURE_SEARCH_INDEX_ID", "keywords-id")},
+    "Vietnam":     {"pc": os.getenv("AZURE_SEARCH_INDEX_VN", "keywords-vn")},
+    "China": {
+        "pc":     os.getenv("AZURE_SEARCH_INDEX_CN_PC",     "kw-30d-query-cn-pc-top-600k"),
+        "mobile": os.getenv("AZURE_SEARCH_INDEX_CN_MOBILE", "kw-30d-query-cn-mobile-top-300k"),
+    },
 }
 
 # AI Search field names (must match the index schema)

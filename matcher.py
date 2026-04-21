@@ -1,5 +1,6 @@
 import pandas as pd
 import Levenshtein
+import concurrent.futures
 from db_manager import DBManager
 from logger import get_logger
 
@@ -24,21 +25,40 @@ class QueryMatcher:
 
         return len(k_clean) / max(len(q_clean), len(k_clean))
 
-    def process_expanded_keywords(self, expanded_keywords, job_id=None, theme_id=None):
+    def _match_single_keyword(self, keyword, device_types):
+        """Run hard match + vector match for one keyword. Returns (keyword, df_hard, df_vector)."""
+        df_hard   = self.db.query_sqlite_contains(keyword, device_types=device_types)
+        df_vector = self.db.query_vector_similarity(keyword, n_results=100, device_types=device_types)
+        return keyword, df_hard, df_vector
+
+    def process_expanded_keywords(self, expanded_keywords, job_id=None, theme_id=None, device_types=None):
         """
         Process a list of expanded keywords and return a combined DataFrame of results.
+        Hard match + vector match for all keywords run in parallel.
+        device_types: e.g. ["pc"], ["mobile"], or ["pc", "mobile"]
         """
         ctx = {"job_id": job_id, "theme_id": theme_id}
         all_results = {}
 
+        # Run all keyword matches in parallel (cap at 4 to avoid Azure Search throttling)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(expanded_keywords))) as executor:
+            futures = {executor.submit(self._match_single_keyword, kw, device_types): kw
+                       for kw in expanded_keywords}
+            keyword_results = {}
+            for future in concurrent.futures.as_completed(futures):
+                kw, df_hard, df_vector = future.result()
+                keyword_results[kw] = (df_hard, df_vector)
+
+        # Merge results in original keyword order (deterministic matched_keyword selection)
         for keyword in expanded_keywords:
             clean_keyword = keyword.replace(" ", "").replace("\u3000", "")
+            df_hard, df_vector = keyword_results[keyword]
+            hard_count = 0
+            vector_count = 0
+
             logger.debug(f"Matching keyword='{keyword}'", extra=ctx)
 
             # --- Method A: Hard Match (Score = 2) ---
-            df_hard = self.db.query_sqlite_contains(keyword)
-            hard_count = 0
-
             for _, row in df_hard.iterrows():
                 q = row['normalized_query']
                 relevance = self.calculate_relevance_hard(q, keyword)
@@ -64,9 +84,6 @@ class QueryMatcher:
                 hard_count += 1
 
             # --- Method B: Vector Match (Score = 1) ---
-            df_vector = self.db.query_vector_similarity(keyword, n_results=100)
-            vector_count = 0
-
             for _, row in df_vector.iterrows():
                 q = row['normalized_query']
                 distance   = row['distance']
