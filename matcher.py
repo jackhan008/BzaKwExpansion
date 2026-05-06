@@ -34,96 +34,86 @@ class QueryMatcher:
     def process_expanded_keywords(self, expanded_keywords, job_id=None, theme_id=None, device_types=None):
         """
         Process a list of expanded keywords and return a combined DataFrame of results.
-        Hard match + vector match for all keywords run in parallel.
+        Hard match uses a single batch SQL query; vector match runs in parallel (max_workers=10).
         device_types: e.g. ["pc"], ["mobile"], or ["pc", "mobile"]
         """
         ctx = {"job_id": job_id, "theme_id": theme_id}
         all_results = {}
 
-        # Run all keyword matches in parallel (cap at 4 to avoid Azure Search throttling)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(expanded_keywords))) as executor:
-            futures = {executor.submit(self._match_single_keyword, kw, device_types): kw
-                       for kw in expanded_keywords}
-            keyword_results = {}
+        # --- Step A: Batch Hard Match (one SQL round-trip for all keywords) ---
+        df_hard_all = self.db.query_sqlite_contains_batch(expanded_keywords, device_types=device_types)
+        for _, row in df_hard_all.iterrows():
+            q       = row["normalized_query"]
+            keyword = row["matched_term"]
+            relevance = self.calculate_relevance_hard(q, keyword)
+
+            if q not in all_results:
+                all_results[q] = {
+                    "normalized_query": q,
+                    "SRPV":             row["SRPV"],
+                    "AdClick":          row["AdClick"],
+                    "revenue":          row["revenue"],
+                    "score_hard":       2,
+                    "score_vector":     0,
+                    "relevance_accum":  relevance,
+                    "match_count":      0,
+                    "matched_keyword":  keyword,
+                }
+            else:
+                all_results[q]["score_hard"] = 2
+                all_results[q]["relevance_accum"] = max(all_results[q]["relevance_accum"], relevance)
+                if len(keyword) < len(all_results[q]["matched_keyword"]):
+                    all_results[q]["matched_keyword"] = keyword
+
+        # --- Step B: Vector Match per keyword in parallel (max_workers=10) ---
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(expanded_keywords))) as executor:
+            futures = {
+                executor.submit(self.db.query_vector_similarity, kw, 100, device_types): kw
+                for kw in expanded_keywords
+            }
+            vector_results = {}
             for future in concurrent.futures.as_completed(futures):
-                kw, df_hard, df_vector = future.result()
-                keyword_results[kw] = (df_hard, df_vector)
+                kw = futures[future]
+                vector_results[kw] = future.result()
 
-        # Merge results in original keyword order (deterministic matched_keyword selection)
         for keyword in expanded_keywords:
+            df_vector = vector_results.get(keyword)
+            if df_vector is None or df_vector.empty:
+                continue
             clean_keyword = keyword.replace(" ", "").replace("\u3000", "")
-            df_hard, df_vector = keyword_results[keyword]
-            hard_count = 0
-            vector_count = 0
 
-            logger.debug(f"Matching keyword='{keyword}'", extra=ctx)
-
-            # --- Method A: Hard Match (Score = 2) ---
-            for _, row in df_hard.iterrows():
-                q = row['normalized_query']
-                relevance = self.calculate_relevance_hard(q, keyword)
-
-                if q not in all_results:
-                    all_results[q] = {
-                        'normalized_query': q,
-                        'SRPV':             row['SRPV'],
-                        'AdClick':          row['AdClick'],
-                        'revenue':          row['revenue'],
-                        'score_hard':       0,
-                        'score_vector':     0,
-                        'relevance_accum':  0,
-                        'match_count':      0,
-                        'matched_keyword':  keyword,
-                    }
-                else:
-                    if len(keyword) < len(all_results[q]['matched_keyword']):
-                        all_results[q]['matched_keyword'] = keyword
-
-                all_results[q]['score_hard'] = 2
-                all_results[q]['relevance_accum'] = max(all_results[q]['relevance_accum'], relevance)
-                hard_count += 1
-
-            # --- Method B: Vector Match (Score = 1) ---
             for _, row in df_vector.iterrows():
-                q = row['normalized_query']
-                distance   = row['distance']
-                similarity = 1 - distance
+                q          = row["normalized_query"]
+                similarity = 1 - row["distance"]
 
                 if similarity < 0.8:
                     continue
 
-                clean_query  = q.replace(" ", "").replace("\u3000", "")
-                is_contained = clean_keyword in clean_query
+                clean_query   = q.replace(" ", "").replace("\u3000", "")
+                is_contained  = clean_keyword in clean_query
+                edit_dist     = Levenshtein.distance(clean_query, clean_keyword)
+                is_typo_match = edit_dist < len(clean_keyword) / 5.0
 
-                edit_dist    = Levenshtein.distance(clean_query, clean_keyword)
-                threshold    = len(clean_keyword) / 5.0
-                is_typo_match = edit_dist < threshold
+                if not (is_contained or is_typo_match):
+                    continue
 
-                if is_contained or is_typo_match:
-                    if q not in all_results:
-                        all_results[q] = {
-                            'normalized_query': q,
-                            'SRPV':             row['SRPV'],
-                            'AdClick':          row['AdClick'],
-                            'revenue':          row['revenue'],
-                            'score_hard':       0,
-                            'score_vector':     0,
-                            'relevance_accum':  0,
-                            'match_count':      0,
-                            'matched_keyword':  keyword,
-                        }
-                    else:
-                        if len(keyword) < len(all_results[q]['matched_keyword']):
-                            all_results[q]['matched_keyword'] = keyword
-
-                    all_results[q]['score_vector'] = 1
-                    all_results[q]['relevance_accum'] = max(all_results[q]['relevance_accum'], similarity)
-                    vector_count += 1
-
-            logger.debug(
-                f"Keyword='{keyword}' | hard={hard_count} vector={vector_count}",
-                extra=ctx
-            )
+                if q not in all_results:
+                    all_results[q] = {
+                        "normalized_query": q,
+                        "SRPV":             row["SRPV"],
+                        "AdClick":          row["AdClick"],
+                        "revenue":          row["revenue"],
+                        "score_hard":       0,
+                        "score_vector":     1,
+                        "relevance_accum":  similarity,
+                        "match_count":      0,
+                        "matched_keyword":  keyword,
+                    }
+                else:
+                    all_results[q]["score_vector"] = 1
+                    all_results[q]["relevance_accum"] = max(all_results[q]["relevance_accum"], similarity)
+                    if len(keyword) < len(all_results[q]["matched_keyword"]):
+                        all_results[q]["matched_keyword"] = keyword
 
         # Build DataFrame
         results_list = []

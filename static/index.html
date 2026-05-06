@@ -326,9 +326,9 @@
             </div>
 
             <div class="form-group">
-                <label for="themes">Enter Search Themes (one per line):</label>
-                <textarea id="themes" placeholder="e.g.&#10;Nike&#10;Running Shoes&#10;iPhone 15"></textarea>
-                <div class="hint">Each line is processed as a separate search theme.</div>
+                <label for="themes">Enter Search Themes (one per line or comma-separated):</label>
+                <textarea id="themes" placeholder="e.g.&#10;iphone, macbook, airpods&#10;or one per line"></textarea>
+                <div class="hint">Separate themes by comma or newline. Each theme is processed independently.</div>
             </div>
 
             <button id="processBtn" onclick="processThemes()">Process Themes</button>
@@ -436,7 +436,7 @@
                 statusDiv.textContent = "Please enter at least one search theme.";
                 statusDiv.className = "error"; return;
             }
-            const themes = text.split('\n').map(t => t.trim()).filter(t => t);
+            const themes = text.split(/[\n,]/).map(t => t.trim()).filter(t => t);
             if (!themes.length) {
                 statusDiv.textContent = "Please enter valid search themes.";
                 statusDiv.className = "error"; return;

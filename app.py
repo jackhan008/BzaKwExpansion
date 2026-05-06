@@ -3,11 +3,12 @@ import uuid
 import json
 import asyncio
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from db_manager import DBManager
@@ -52,8 +53,25 @@ async def lifespan(app: FastAPI):
     logger.info("Server shutting down.")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="BZA Keyword Expansion API",
+    description="Brand keyword expansion: AI expand → database match → AI validate",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ---------- Auth ----------
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Security(_api_key_header)):
+    """Verify X-API-Key header. Skipped when API_KEY is not configured."""
+    if not config.API_KEY:
+        return  # open access
+    if api_key != config.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # ---------- Request / Response models ----------
@@ -247,6 +265,181 @@ async def get_theme(job_id: str, theme_id: str):
     return {**theme, "batches": batches}
 
 
+# ---------- v1 Public API ----------
+
+def _df_to_query_list(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Convert result DataFrame rows to a list of dicts for JSON output."""
+    if df is None or df.empty:
+        return []
+    rows = []
+    for _, row in df.iterrows():
+        entry: Dict[str, Any] = {"query": row.get("normalized_query", "")}
+        for src, dst in [("Score", "score"), ("Relevance", "relevance"),
+                         ("SRPV", "srpv"), ("AdClick", "ad_clicks"), ("revenue", "revenue")]:
+            if src in row and pd.notna(row[src]):
+                val = row[src]
+                entry[dst] = float(val) if isinstance(val, float) else int(val) if isinstance(val, (int,)) else val
+        if "AI_Valid" in row:
+            entry["ai_valid"] = bool(row["AI_Valid"])
+        if "AI_Reason" in row and pd.notna(row.get("AI_Reason")):
+            entry["ai_reason"] = str(row["AI_Reason"])
+        rows.append(entry)
+    return rows
+
+
+class V1ExpandRequest(BaseModel):
+    themes: List[str]
+    market: Optional[str] = "Australia"
+    device_types: Optional[List[str]] = ["pc"]  # "pc", "mobile", or both
+    landing_pages: Optional[Dict[str, str]] = None  # {theme: url}
+
+
+class V1ThemeResult(BaseModel):
+    theme: str
+    expanded_keywords: List[str]
+    match_count: int
+    matched_queries: List[Dict[str, Any]]
+
+
+class V1ExpandResponse(BaseModel):
+    job_id: str
+    market: str
+    results: List[V1ThemeResult]
+
+
+@app.get(
+    "/v1/markets",
+    summary="List available markets",
+    dependencies=[Security(verify_api_key)],
+    tags=["v1"],
+)
+async def v1_get_markets():
+    """Return supported markets and their languages."""
+    return {
+        "markets": config.AVAILABLE_MARKETS,
+        "default_market": config.DEFAULT_MARKET,
+        "market_languages": config.MARKET_LANGUAGES,
+    }
+
+
+@app.post(
+    "/v1/expand",
+    response_model=V1ExpandResponse,
+    summary="Expand themes and return matched queries (JSON)",
+    dependencies=[Security(verify_api_key)],
+    tags=["v1"],
+)
+async def v1_expand(request: V1ExpandRequest):
+    """
+    Expand one or more brand/product themes into matched search queries.
+
+    - **themes**: list of brand or product names
+    - **market**: target market (default: Australia)
+    - **device_types**: `["pc"]`, `["mobile"]`, or `["pc", "mobile"]`
+    - **landing_pages**: optional map of `{theme: url}` to enrich brand context
+    """
+    if not request.themes:
+        raise HTTPException(status_code=400, detail="themes must not be empty")
+
+    job_id      = uuid.uuid4().hex[:8]
+    market      = request.market or config.DEFAULT_MARKET
+    device_types = request.device_types or ["pc"]
+    themes      = [t for t in request.themes if t.strip()]
+    ctx         = {"job_id": job_id}
+
+    if market not in config.AVAILABLE_MARKETS:
+        raise HTTPException(status_code=400, detail=f"Unknown market '{market}'. Available: {config.AVAILABLE_MARKETS}")
+
+    logger.info(f"[v1] expand | themes={themes} market={market} device_types={device_types}", extra=ctx)
+    matcher = get_matcher(market)
+
+    brand_contexts = {}
+    if request.landing_pages:
+        for theme, url in request.landing_pages.items():
+            if url and theme in themes:
+                brand_contexts[theme] = fetch_brand_context(url)
+
+    results: List[V1ThemeResult] = []
+    for theme, df, expanded_keywords in process_themes_parallel(
+        themes, expander, matcher, market, job_id=job_id,
+        brand_contexts=brand_contexts, device_types=device_types
+    ):
+        results.append(V1ThemeResult(
+            theme=theme,
+            expanded_keywords=expanded_keywords,
+            match_count=len(df) if not df.empty else 0,
+            matched_queries=_df_to_query_list(df),
+        ))
+
+    logger.info(f"[v1] expand done | total_queries={sum(r.match_count for r in results)}", extra=ctx)
+    return V1ExpandResponse(job_id=job_id, market=market, results=results)
+
+
+@app.post(
+    "/v1/expand/stream",
+    summary="Expand themes — streaming NDJSON",
+    dependencies=[Security(verify_api_key)],
+    tags=["v1"],
+)
+async def v1_expand_stream(request: V1ExpandRequest):
+    """
+    Same as `/v1/expand` but streams results as newline-delimited JSON (NDJSON).
+
+    **Event types** (one JSON object per line):
+
+    | type | payload |
+    |---|---|
+    | `job_start` | `{job_id}` |
+    | `theme_result` | `{theme, expanded_keywords, match_count, matched_queries}` |
+    | `complete` | `{job_id}` |
+    | `error` | `{message}` |
+    """
+    if not request.themes:
+        raise HTTPException(status_code=400, detail="themes must not be empty")
+
+    job_id       = uuid.uuid4().hex[:8]
+    market       = request.market or config.DEFAULT_MARKET
+    device_types = request.device_types or ["pc"]
+    themes       = [t for t in request.themes if t.strip()]
+    ctx          = {"job_id": job_id}
+
+    if market not in config.AVAILABLE_MARKETS:
+        raise HTTPException(status_code=400, detail=f"Unknown market '{market}'. Available: {config.AVAILABLE_MARKETS}")
+
+    logger.info(f"[v1] stream | themes={themes} market={market} device_types={device_types}", extra=ctx)
+    matcher = get_matcher(market)
+
+    brand_contexts = {}
+    if request.landing_pages:
+        for theme, url in request.landing_pages.items():
+            if url and theme in themes:
+                brand_contexts[theme] = fetch_brand_context(url)
+
+    async def event_generator():
+        yield json.dumps({"type": "job_start", "job_id": job_id}) + "\n"
+        loop = asyncio.get_running_loop()
+        try:
+            ordered = await loop.run_in_executor(
+                None, process_themes_parallel,
+                themes, expander, matcher, market, 3, job_id, brand_contexts, device_types
+            )
+            for theme, df, expanded_keywords in ordered:
+                yield json.dumps({
+                    "type": "theme_result",
+                    "data": {
+                        "theme":             theme,
+                        "expanded_keywords": expanded_keywords,
+                        "match_count":       len(df) if not df.empty else 0,
+                        "matched_queries":   _df_to_query_list(df),
+                    }
+                }) + "\n"
+        except Exception as exc:
+            logger.exception(f"[v1] stream error", extra=ctx)
+            yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+            return
+        yield json.dumps({"type": "complete", "job_id": job_id}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7888)

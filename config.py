@@ -124,9 +124,21 @@ AVAILABLE_MARKETS = list(MARKET_LANGUAGES.keys())
 # Environment: "local" -> AzureCliCredential, "cloud" -> ManagedIdentityCredential
 APP_ENV = os.getenv("APP_ENV", "local")
 
-# Toggle: set USE_AZURE_DATASOURCE=true to use Azure SQL + AI Search instead of
-# local SQLite + FAISS files. Existing local DB files are NOT deleted.
+# Toggle: set USE_AZURE_DATASOURCE=true to use ClickHouse (Hard Match) + Azure AI Search (Vector)
+# instead of local SQLite + FAISS. Existing local DB files are NOT deleted.
 USE_AZURE_DATASOURCE = os.getenv("USE_AZURE_DATASOURCE", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# ClickHouse Configuration (Hard Match backend)
+# ---------------------------------------------------------------------------
+CLICKHOUSE_HOST     = os.getenv("CLICKHOUSE_HOST", "159.27.42.206")
+CLICKHOUSE_PORT     = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "default")
+CLICKHOUSE_USERNAME = os.getenv("CLICKHOUSE_USERNAME", "default")
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
+CLICKHOUSE_TABLE    = os.getenv("CLICKHOUSE_TABLE", "SearchRawData_Global")
+CLICKHOUSE_SRPV_MIN = int(os.getenv("CLICKHOUSE_SRPV_MIN", "30"))   # min aggregated SRPV
+CLICKHOUSE_DAYS     = int(os.getenv("CLICKHOUSE_DAYS", "30"))        # lookback window
 
 # Azure SQL Database (Hard Match)
 # Required when USE_AZURE_DATASOURCE=true
@@ -146,6 +158,7 @@ AZURE_SQL_TABLE_DEFAULT = os.getenv("AZURE_SQL_TABLE_DEFAULT", "KeywordExpansion
 # Per-market table overrides (optional). If a market is listed here, its queries go to this table.
 AZURE_SQL_TABLE_BY_MARKET = {
     "China": os.getenv("AZURE_SQL_TABLE_CN", "KeywordExpansion_30d_query_cn_gt_50"),
+    "Japan": os.getenv("AZURE_SQL_TABLE_JP", "KeywordExpansion_30d_jp_srpv_gt_100"),
 }
 
 # Market code mapping for TargetMarket column
@@ -178,8 +191,8 @@ AZURE_SEARCH_API_KEY     = os.getenv("AZURE_SEARCH_API_KEY")
 MARKET_SEARCH_INDEX = {
     "Australia":   {"pc": os.getenv("AZURE_SEARCH_INDEX_AU", "keywords-au")},
     "Japan": {
-        "pc":     os.getenv("AZURE_SEARCH_INDEX_JP_PC",     "kw-30d-query-jp-pc-top-300k"),
-        "mobile": os.getenv("AZURE_SEARCH_INDEX_JP_MOBILE", "kw-30d-query-jp-mobile-top-300k"),
+        "pc":     os.getenv("AZURE_SEARCH_INDEX_JP_PC",     "30d-query-jp-pc-top-600k"),
+        "mobile": os.getenv("AZURE_SEARCH_INDEX_JP_MOBILE", "30d-query-jp-mobile-top-300k-data"),
     },
     "India":       {"pc": os.getenv("AZURE_SEARCH_INDEX_IN", "keywords-in")},
     "Singapore":   {"pc": os.getenv("AZURE_SEARCH_INDEX_SG", "keywords-sg")},
@@ -200,6 +213,15 @@ AZURE_SEARCH_SRPV_FIELD    = os.getenv("AZURE_SEARCH_SRPV_FIELD",    "SRPV")
 AZURE_SEARCH_ADCLICK_FIELD = os.getenv("AZURE_SEARCH_ADCLICK_FIELD", "AdClick")
 AZURE_SEARCH_REVENUE_FIELD = os.getenv("AZURE_SEARCH_REVENUE_FIELD", "revenue")
 AZURE_SEARCH_TOP_K         = int(os.getenv("AZURE_SEARCH_TOP_K", "100"))
+
+
+# ---------------------------------------------------------------------------
+# Public API Configuration
+# ---------------------------------------------------------------------------
+
+# Set API_KEY in .env to require authentication on /v1/* endpoints.
+# Leave empty (default) to allow unauthenticated access.
+API_KEY = os.getenv("API_KEY", "")
 
 
 def get_azure_credential():

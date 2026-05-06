@@ -430,3 +430,33 @@ class AIExpander:
             extra=ctx
         )
         return all_results
+
+    def get_katakana_phonetic(self, brand_name: str) -> str:
+        """Convert a brand/product name to its Japanese katakana phonetic reading.
+
+        Returns the katakana string (e.g. 'アマゾン') or empty string on failure.
+        """
+        client = self._get_client()
+        try:
+            response = client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a Japanese phonetics expert. "
+                            "Convert the given brand/product name to its Japanese katakana phonetic reading. "
+                            "Return ONLY the katakana string, nothing else. No explanation."
+                        ),
+                    },
+                    {"role": "user", "content": f'"{brand_name}"'},
+                ],
+                max_tokens=50,
+                temperature=0,
+            )
+            result = response.choices[0].message.content.strip().strip('"').strip()
+            logger.info(f"Katakana phonetic | brand='{brand_name}' → '{result}'")
+            return result
+        except Exception as e:
+            logger.error(f"get_katakana_phonetic failed for '{brand_name}': {e}")
+            return ""

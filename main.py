@@ -53,6 +53,18 @@ def process_theme(theme, expander, matcher, market="Australia", job_id=None, the
             )
         job_store.update_theme_expanded(theme_id=theme_id, expanded_keywords=expanded_keywords)
 
+        # Deduplicate expanded keywords (strip spaces + lowercase normalization)
+        seen_normalized = set()
+        deduped = []
+        for kw in expanded_keywords:
+            norm = kw.replace(" ", "").replace("\u3000", "").lower()
+            if norm not in seen_normalized:
+                seen_normalized.add(norm)
+                deduped.append(kw)
+        if len(deduped) < len(expanded_keywords):
+            logger.info(f"Dedup: {len(expanded_keywords)} → {len(deduped)} keywords", extra=ctx)
+        expanded_keywords = deduped
+
         # Step 2: Matching
         logger.info(f"Step 2/3 Matching start | keywords={len(expanded_keywords)}", extra=ctx)
         results_df = matcher.process_expanded_keywords(expanded_keywords, job_id=job_id, theme_id=theme_id, device_types=device_types)

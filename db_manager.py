@@ -5,10 +5,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import os
-import struct
-import threading
 import config
-
 
 class DBManager:
     def __init__(self, market="Australia", use_azure=False):
@@ -33,22 +30,24 @@ class DBManager:
             else:
                 self.index = None
         else:
-            # Azure mode: no local embedding model or FAISS index needed
+            # Azure mode: ClickHouse for Hard Match + Azure AI Search for Vector Match
             self.embedding_model = None
             self.index = None
-            self._credential = config.get_azure_credential()
-            # _search_indexes_by_device: {device_type: index_name}
-            # e.g. {"pc": "kw-...-pc", "mobile": "kw-...-mobile"} or {"pc": "keywords-au"}
+
+            # ClickHouse engine (thread-safe, reused across all queries)
+            from clickhouse_client import create_clickhouse_engine
+            self._ch_engine = create_clickhouse_engine(config.CLICKHOUSE_PASSWORD)
+
+            # Azure AI Search index config per device type
             idx_config = config.MARKET_SEARCH_INDEX.get(market, {"pc": f"keywords-{market.lower()}"})
             if isinstance(idx_config, dict):
                 self._search_indexes_by_device = idx_config
             elif isinstance(idx_config, list):
-                # legacy list format — treat as pc + mobile in order
                 devices = ["pc", "mobile"]
                 self._search_indexes_by_device = {devices[i]: v for i, v in enumerate(idx_config)}
             else:
                 self._search_indexes_by_device = {"pc": idx_config}
-            self._local = threading.local()   # thread-local Azure SQL connection cache
+            self._credential = config.get_azure_credential()
 
     
     def _load_market_config(self, market):
@@ -137,14 +136,37 @@ class DBManager:
         faiss.write_index(self.index, self.vector_db_path)
         print("FAISS Index initialized and saved.")
 
+    def query_sqlite_contains_batch(self, terms, device_types=None):
+        """Batch Hard Match for multiple terms — single round-trip to ClickHouse (or SQLite fallback).
+
+        Returns a DataFrame with an extra 'matched_term' column indicating which input term
+        produced each row. When a query matches multiple terms, it appears multiple times.
+        """
+        if not terms:
+            return pd.DataFrame(columns=["normalized_query", "SRPV", "AdClick", "revenue", "matched_term"])
+        if self.use_azure:
+            return self._query_ch_contains_batch(terms, device_types or ["pc"])
+
+        # Local SQLite fallback: call single-term query per term and tag rows
+        dfs = []
+        for term in terms:
+            df = self.query_sqlite_contains(term, device_types)
+            if not df.empty:
+                df = df.copy()
+                df["matched_term"] = term
+                dfs.append(df)
+        if not dfs:
+            return pd.DataFrame(columns=["normalized_query", "SRPV", "AdClick", "revenue", "matched_term"])
+        return pd.concat(dfs, ignore_index=True)
+
     def query_sqlite_contains(self, term, device_types=None):
         """Finds queries containing the term (Hard Match).
 
-        Routes to Azure SQL or local SQLite based on use_azure flag.
-        device_types: list of device types to filter (Azure mode only); None means ["pc"].
+        Routes to ClickHouse or local SQLite based on use_azure flag.
+        device_types: list of device types to filter; None means ["pc"].
         """
         if self.use_azure:
-            return self._query_azure_sql_contains(term, device_types or ["pc"])
+            return self._query_ch_contains(term, device_types or ["pc"])
 
         conn = sqlite3.connect(self.sqlite_path)
         # Remove both half-width and full-width spaces from the search term
@@ -212,70 +234,78 @@ class DBManager:
         return df_results
 
     # ------------------------------------------------------------------
-    # Azure backend — private methods
+    # ClickHouse backend — Hard Match queries
     # ------------------------------------------------------------------
 
-    def _get_azure_sql_connection(self):
-        """Return a thread-local pyodbc connection to Azure SQL (token-based auth).
+    @staticmethod
+    def _escape_like(term: str) -> str:
+        """Escape ClickHouse LIKE special characters in a search term."""
+        return term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
-        The connection is created once per thread and reused across queries.
-        A lightweight liveness check (SELECT 1) recycles stale connections.
+    def _query_ch_contains(self, term, device_types) -> pd.DataFrame:
+        """Hard Match via ClickHouse — single term, returns normalized_query + SRPV.
+
+        Aggregates last CLICKHOUSE_DAYS days, filters sum(Srpv) >= CLICKHOUSE_SRPV_MIN.
+        Matches on replaceAll(lower(Query), ' ', '') for space-insensitive LIKE.
         """
-        import pyodbc
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            try:
-                conn.execute("SELECT 1")
-            except Exception:
-                conn = None
-        if conn is None:
-            token = self._credential.get_token("https://database.windows.net/.default").token
-            token_bytes = token.encode("utf-16-le")
-            token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
-            conn_str = (
-                f"Driver={{{config.AZURE_SQL_DRIVER}}};"
-                f"Server={config.AZURE_SQL_SERVER},{config.AZURE_SQL_PORT};"
-                f"Database={config.AZURE_SQL_DATABASE};"
-                "Encrypt=yes;TrustServerCertificate=no;"
-            )
-            SQL_COPT_SS_ACCESS_TOKEN = 1256
-            conn = pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
-            self._local.conn = conn
-        return conn
+        from sqlalchemy import text
 
-    def _query_azure_sql_contains(self, term, device_types) -> pd.DataFrame:
-        """Hard Match via Azure SQL — parameterized query, returns same schema as SQLite path.
+        market_code = config.AZURE_SQL_MARKET_CODE.get(self.market, self.market.lower())
+        clean_term  = self._escape_like(term.replace(" ", "").replace("\u3000", "").lower())
+        dt_list     = ", ".join(f"'{dt}'" for dt in device_types)
+        table       = config.CLICKHOUSE_TABLE
+        days        = config.CLICKHOUSE_DAYS
+        srpv_min    = config.CLICKHOUSE_SRPV_MIN
 
-        Filters by TargetMarket and DeviceType.
-        Field mapping: Query -> normalized_query, Srpv -> SRPV.
-        AdClick and revenue are not available in this table, defaulted to 0.
+        sql = f"""
+            SELECT Query AS normalized_query, sum(Srpv) AS SRPV
+            FROM {table}
+            WHERE TargetMarket = :market
+              AND DeviceType IN ({dt_list})
+              AND ReportDate >= today() - {days}
+              AND replaceAll(lower(Query), ' ', '') LIKE :pattern
+            GROUP BY Query
+            HAVING SRPV >= {srpv_min}
         """
-        clean_term  = term.replace(" ", "").replace("\u3000", "")
-        table       = config.AZURE_SQL_TABLE_BY_MARKET.get(self.market, config.AZURE_SQL_TABLE_DEFAULT)
-        market_code = config.AZURE_SQL_MARKET_CODE.get(self.market)
+        with self._ch_engine.connect() as conn:
+            df = pd.read_sql(text(sql), conn, params={"market": market_code, "pattern": f"%{clean_term}%"})
+        df["AdClick"] = 0
+        df["revenue"] = 0
+        return df
 
-        placeholders = ", ".join("?" * len(device_types))
+    def _query_ch_contains_batch(self, terms, device_types) -> pd.DataFrame:
+        """Batch Hard Match via ClickHouse — single UNION ALL for all terms, one round-trip.
 
-        if self.market in config.AZURE_SQL_TABLE_BY_MARKET:
-            # Market-specific table (e.g. China): prefix-only match until index is ready.
-            sql = (
-                f"SELECT Query, Srpv FROM dbo.[{table}] "
-                f"WHERE DeviceType IN ({placeholders}) AND Query LIKE ?"
+        Each SELECT block carries the originating term as matched_term.
+        Uses replaceAll(lower(Query), ' ', '') LIKE '%cleanterm%' for space-insensitive matching.
+        """
+        from sqlalchemy import text
+
+        market_code = config.AZURE_SQL_MARKET_CODE.get(self.market, self.market.lower())
+        dt_list     = ", ".join(f"'{dt}'" for dt in device_types)
+        table       = config.CLICKHOUSE_TABLE
+        days        = config.CLICKHOUSE_DAYS
+        srpv_min    = config.CLICKHOUSE_SRPV_MIN
+
+        union_parts = []
+        params      = {"market": market_code}
+
+        for i, term in enumerate(terms):
+            clean_term = self._escape_like(term.replace(" ", "").replace("\u3000", "").lower())
+            params[f"p{i}"] = f"%{clean_term}%"
+            params[f"t{i}"] = term
+            union_parts.append(
+                f"SELECT Query AS normalized_query, sum(Srpv) AS SRPV, :t{i} AS matched_term "
+                f"FROM {table} "
+                f"WHERE TargetMarket = :market AND DeviceType IN ({dt_list}) "
+                f"AND ReportDate >= today() - {days} "
+                f"AND replaceAll(lower(Query), ' ', '') LIKE :p{i} "
+                f"GROUP BY Query HAVING SRPV >= {srpv_min}"
             )
-            params = (*device_types, f"{clean_term}%")
-        else:
-            # Default table has QueryClean persisted computed column (spaces stripped).
-            sql = (
-                f"SELECT Query, Srpv FROM dbo.[{table}] "
-                f"WHERE TargetMarket = ? AND DeviceType IN ({placeholders}) "
-                f"AND QueryClean LIKE ?"
-            )
-            params = (market_code, *device_types, f"%{clean_term}%")
 
-        conn = self._get_azure_sql_connection()
-        df = pd.read_sql(sql, conn, params=params)
-
-        df = df.rename(columns={"Query": "normalized_query", "Srpv": "SRPV"})
+        sql = " UNION ALL ".join(union_parts)
+        with self._ch_engine.connect() as conn:
+            df = pd.read_sql(text(sql), conn, params=params)
         df["AdClick"] = 0
         df["revenue"] = 0
         return df
